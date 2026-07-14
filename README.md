@@ -53,8 +53,10 @@ Update. Runs on stock Windows 10 and 11.
 
 ## Building
 
-No third-party SDKs, no vcpkg/NuGet — everything links against Windows system
-libraries. Any one of these works:
+Full step-by-step instructions (all toolchains, output paths,
+troubleshooting): **[BUILDING.md](BUILDING.md)**. Short version — no
+third-party SDKs, no vcpkg/NuGet, everything links against Windows system
+libraries, and any one of these works:
 
 **Visual Studio (recommended)** — VS 2022 with the *Desktop development with
 C++* workload (MFC not required). Open **`PhotoGallery.sln`** and build
