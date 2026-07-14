@@ -1,6 +1,10 @@
 build/
 out/
 .vs/
+x64/
+Debug/
+Release/
+*.vcxproj.user
 *.exe
 *.obj
 *.o

@@ -57,13 +57,15 @@ No third-party SDKs, no vcpkg/NuGet — everything links against Windows system
 libraries. Any one of these works:
 
 **Visual Studio (recommended)** — VS 2022 with the *Desktop development with
-C++* workload (MFC not required):
+C++* workload (MFC not required). Open **`PhotoGallery.sln`** and build
+(x64, Debug/Release), or from a command prompt:
+
+    msbuild PhotoGallery.sln -p:Configuration=Release -p:Platform=x64
+
+CMake also works if you prefer it (*File → Open → Folder*, or):
 
     cmake -B build -G "Visual Studio 17 2022" -A x64
     cmake --build build --config Release
-
-or simply *File → Open → Folder* on this repo in Visual Studio and build the
-`PhotoGallery` target.
 
 **Plain MSVC, no CMake** — from an *x64 Native Tools Command Prompt*:
 
