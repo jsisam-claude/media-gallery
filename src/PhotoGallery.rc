@@ -1,0 +1,92 @@
+#include <windows.h>
+#include "resource.h"
+
+IDR_MAINMENU MENU
+BEGIN
+    POPUP "&File"
+    BEGIN
+        MENUITEM "&Open...\tCtrl+O",            IDM_OPEN
+        MENUITEM SEPARATOR
+        MENUITEM "E&xit\tEsc",                  IDM_EXIT
+    END
+    POPUP "&Edit"
+    BEGIN
+        MENUITEM "&Edit in Paint\tE",           IDM_EDIT_PAINT
+        MENUITEM SEPARATOR
+        MENUITEM "Rotate &Right\tCtrl+R",       IDM_ROTATE_CW
+        MENUITEM "Rotate &Left\tCtrl+Shift+R",  IDM_ROTATE_CCW
+        MENUITEM "&Save Rotation\tCtrl+S",      IDM_SAVE
+        MENUITEM SEPARATOR
+        MENUITEM "&Delete\tDel",                IDM_DELETE
+    END
+    POPUP "&View"
+    BEGIN
+        MENUITEM "&Details\tI",                 IDM_DETAILS
+        MENUITEM "Film&strip\tT",               IDM_FILMSTRIP
+        MENUITEM SEPARATOR
+        MENUITEM "Zoom &In\tCtrl++",            IDM_ZOOMIN
+        MENUITEM "Zoom &Out\tCtrl+-",           IDM_ZOOMOUT
+        MENUITEM "&Fit to Window\tCtrl+0",      IDM_FIT
+        MENUITEM SEPARATOR
+        MENUITEM "&Next Image\tRight",          IDM_NEXT
+        MENUITEM "&Previous Image\tLeft",       IDM_PREV
+        MENUITEM "Next Pa&ge\tDown",            IDM_PAGE_NEXT
+        MENUITEM "Previo&us Page\tUp",          IDM_PAGE_PREV
+    END
+END
+
+IDR_ACCEL ACCELERATORS
+BEGIN
+    "O",        IDM_OPEN,       VIRTKEY, CONTROL
+    VK_ESCAPE,  IDM_EXIT,       VIRTKEY
+    "E",        IDM_EDIT_PAINT, VIRTKEY
+    "E",        IDM_EDIT_PAINT, VIRTKEY, CONTROL
+    "R",        IDM_ROTATE_CW,  VIRTKEY, CONTROL
+    "R",        IDM_ROTATE_CCW, VIRTKEY, CONTROL, SHIFT
+    "S",        IDM_SAVE,       VIRTKEY, CONTROL
+    VK_DELETE,  IDM_DELETE,     VIRTKEY
+    "I",        IDM_DETAILS,    VIRTKEY
+    VK_RETURN,  IDM_DETAILS,    VIRTKEY, ALT
+    "T",        IDM_FILMSTRIP,  VIRTKEY
+    0xBB,       IDM_ZOOMIN,     VIRTKEY, CONTROL  // VK_OEM_PLUS
+    0x6B,       IDM_ZOOMIN,     VIRTKEY, CONTROL  // VK_ADD (numpad)
+    0xBD,       IDM_ZOOMOUT,    VIRTKEY, CONTROL  // VK_OEM_MINUS
+    0x6D,       IDM_ZOOMOUT,    VIRTKEY, CONTROL  // VK_SUBTRACT (numpad)
+    "0",        IDM_FIT,        VIRTKEY, CONTROL
+    VK_RIGHT,   IDM_NEXT,       VIRTKEY
+    VK_LEFT,    IDM_PREV,       VIRTKEY
+    VK_DOWN,    IDM_PAGE_NEXT,  VIRTKEY
+    VK_UP,      IDM_PAGE_PREV,  VIRTKEY
+    VK_NEXT,    IDM_PAGE_NEXT,  VIRTKEY
+    VK_PRIOR,   IDM_PAGE_PREV,  VIRTKEY
+END
+
+// Application manifest (DPI awareness, asInvoker)
+1 24 "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK  0x3fL
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription",  "Photo Gallery"
+            VALUE "ProductName",      "Photo Gallery"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "OriginalFilename", "PhotoGallery.exe"
+            VALUE "InternalName",     "PhotoGallery"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

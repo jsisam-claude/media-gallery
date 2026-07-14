@@ -1,0 +1,1429 @@
+// Photo Gallery — minimal, secure Windows photo viewer (WinAPI + modular decoders).
+// See README.md for keys and design notes.
+#include <windows.h>
+#include <windowsx.h>
+#include <shellapi.h>
+#include <shlwapi.h>
+#include <shlobj.h>
+#include <shobjidl.h>
+#include <exdisp.h>
+#include <servprov.h>
+#include <shlguid.h>
+
+#include <algorithm>
+#include <cmath>
+#include <deque>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "decoder.h"
+#include "filmstrip.h"
+#include "resource.h"
+
+#define WM_APP_DECODED (WM_APP + 1)
+#define WM_APP_THUMB   (WM_APP + 2)
+#define WM_APP_LIST    (WM_APP + 3)
+#define WM_APP_SAVED   (WM_APP + 4)
+
+namespace {
+
+constexpr COLORREF kBg = RGB(30, 30, 30);
+constexpr COLORREF kPanelBg = RGB(24, 24, 24);
+constexpr COLORREF kPanelBorder = RGB(80, 80, 80);
+constexpr COLORREF kText = RGB(235, 235, 235);
+constexpr COLORREF kTextDim = RGB(160, 160, 160);
+constexpr COLORREF kAccent = RGB(0, 120, 215);
+constexpr double kMinZoom = 0.05, kMaxZoom = 16.0;
+constexpr UINT_PTR kTimerHq = 1;
+
+// ---------------------------------------------------------------- decode worker
+
+struct DecodeDone {
+    std::wstring path;
+    UINT page;
+    DecodedImage* img; // null = decode failed
+};
+struct SaveDone {
+    std::wstring path;
+    bool ok;
+};
+
+class DecodeWorker {
+public:
+    void Start(HWND owner) {
+        owner_ = owner;
+        InitializeCriticalSection(&cs_);
+        InitializeConditionVariable(&cv_);
+        thread_ = CreateThread(nullptr, 0, &DecodeWorker::ThreadProc, this, 0, nullptr);
+    }
+    void Stop() {
+        if (!thread_) return;
+        EnterCriticalSection(&cs_);
+        quit_ = true;
+        LeaveCriticalSection(&cs_);
+        WakeConditionVariable(&cv_);
+        WaitForSingleObject(thread_, INFINITE);
+        CloseHandle(thread_);
+        thread_ = nullptr;
+        DeleteCriticalSection(&cs_);
+    }
+    // Most-recent-wins: drops queued decodes (keeps queued saves).
+    void RequestCurrent(const std::wstring& path, UINT page) {
+        EnterCriticalSection(&cs_);
+        q_.erase(std::remove_if(q_.begin(), q_.end(),
+                                [](const Job& j) { return j.kind == Job::Decode; }),
+                 q_.end());
+        q_.push_front({Job::Decode, path, page, 0});
+        LeaveCriticalSection(&cs_);
+        WakeConditionVariable(&cv_);
+    }
+    void RequestPrefetch(const std::wstring& path, UINT page) {
+        EnterCriticalSection(&cs_);
+        q_.push_back({Job::Decode, path, page, 0});
+        LeaveCriticalSection(&cs_);
+        WakeConditionVariable(&cv_);
+    }
+    void RequestSave(const std::wstring& path, int quarter) {
+        EnterCriticalSection(&cs_);
+        q_.push_back({Job::Save, path, 0, quarter});
+        LeaveCriticalSection(&cs_);
+        WakeConditionVariable(&cv_);
+    }
+
+private:
+    struct Job {
+        enum Kind { Decode, Save } kind;
+        std::wstring path;
+        UINT page;
+        int quarter;
+    };
+    static DWORD WINAPI ThreadProc(void* self) {
+        static_cast<DecodeWorker*>(self)->Loop();
+        return 0;
+    }
+    void Loop() {
+        HRESULT coInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        for (;;) {
+            EnterCriticalSection(&cs_);
+            while (q_.empty() && !quit_) SleepConditionVariableCS(&cv_, &cs_, INFINITE);
+            if (quit_) {
+                LeaveCriticalSection(&cs_);
+                break;
+            }
+            Job job = std::move(q_.front());
+            q_.pop_front();
+            LeaveCriticalSection(&cs_);
+
+            ImageDecoder* dec = FindDecoder(job.path);
+            if (job.kind == Job::Decode) {
+                DecodedImage* img = nullptr;
+                if (dec) img = dec->Load(job.path, job.page).release();
+                auto* d = new DecodeDone{std::move(job.path), job.page, img};
+                if (!PostMessageW(owner_, WM_APP_DECODED, 0, reinterpret_cast<LPARAM>(d))) {
+                    delete d->img;
+                    delete d;
+                }
+            } else {
+                bool ok = dec && dec->SaveRotation(job.path, job.quarter);
+                auto* d = new SaveDone{std::move(job.path), ok};
+                if (!PostMessageW(owner_, WM_APP_SAVED, 0, reinterpret_cast<LPARAM>(d)))
+                    delete d;
+            }
+        }
+        if (SUCCEEDED(coInit)) CoUninitialize();
+    }
+
+    HWND owner_ = nullptr;
+    HANDLE thread_ = nullptr;
+    CRITICAL_SECTION cs_{};
+    CONDITION_VARIABLE cv_{};
+    std::deque<Job> q_;
+    bool quit_ = false;
+};
+
+// ------------------------------------------------- folder list (Explorer order)
+
+struct ListDone {
+    unsigned gen;
+    std::vector<std::wstring> files;
+    int start;
+};
+struct ListReq {
+    HWND hwnd;
+    unsigned gen;
+    std::wstring target; // file or folder (canonical)
+    bool isFolder;
+};
+
+std::wstring ParentDir(const std::wstring& path) {
+    wchar_t buf[MAX_PATH];
+    lstrcpynW(buf, path.c_str(), MAX_PATH);
+    PathRemoveFileSpecW(buf);
+    return buf;
+}
+
+// Items of an open Explorer window showing `dir`, in its current display order.
+std::vector<std::wstring> ExplorerViewOrder(const std::wstring& dir) {
+    std::vector<std::wstring> out;
+    IShellWindows* sw = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_LOCAL_SERVER,
+                                IID_IShellWindows, reinterpret_cast<void**>(&sw))))
+        return out;
+    long count = 0;
+    sw->get_Count(&count);
+    for (long i = 0; i < count && out.empty(); ++i) {
+        VARIANT v;
+        VariantInit(&v);
+        v.vt = VT_I4;
+        v.lVal = i;
+        IDispatch* disp = nullptr;
+        if (sw->Item(v, &disp) != S_OK || !disp) continue;
+
+        IServiceProvider* sp = nullptr;
+        IShellBrowser* sb = nullptr;
+        IShellView* sv = nullptr;
+        IFolderView* fv = nullptr;
+        IPersistFolder2* pf = nullptr;
+        PIDLIST_ABSOLUTE folderPidl = nullptr;
+
+        if (SUCCEEDED(disp->QueryInterface(IID_IServiceProvider,
+                                           reinterpret_cast<void**>(&sp))) &&
+            SUCCEEDED(sp->QueryService(SID_STopLevelBrowser, IID_IShellBrowser,
+                                       reinterpret_cast<void**>(&sb))) &&
+            SUCCEEDED(sb->QueryActiveShellView(&sv)) &&
+            SUCCEEDED(sv->QueryInterface(IID_IFolderView,
+                                         reinterpret_cast<void**>(&fv))) &&
+            SUCCEEDED(fv->GetFolder(IID_IPersistFolder2,
+                                    reinterpret_cast<void**>(&pf))) &&
+            SUCCEEDED(pf->GetCurFolder(&folderPidl))) {
+            wchar_t folderPath[MAX_PATH];
+            if (SHGetPathFromIDListW(folderPidl, folderPath) &&
+                lstrcmpiW(folderPath, dir.c_str()) == 0) {
+                int n = 0;
+                if (SUCCEEDED(fv->ItemCount(SVGIO_ALLVIEW, &n))) {
+                    for (int j = 0; j < n; ++j) {
+                        PITEMID_CHILD child = nullptr;
+                        if (fv->Item(j, &child) != S_OK || !child) continue;
+                        PIDLIST_ABSOLUTE full = ILCombine(folderPidl, child);
+                        wchar_t buf[MAX_PATH];
+                        if (full && SHGetPathFromIDListW(full, buf) &&
+                            IsSupportedImage(buf))
+                            out.push_back(buf);
+                        if (full) ILFree(full);
+                        CoTaskMemFree(child);
+                    }
+                }
+            }
+        }
+        if (folderPidl) CoTaskMemFree(folderPidl);
+        if (pf) pf->Release();
+        if (fv) fv->Release();
+        if (sv) sv->Release();
+        if (sb) sb->Release();
+        if (sp) sp->Release();
+        disp->Release();
+    }
+    sw->Release();
+    return out;
+}
+
+std::vector<std::wstring> EnumerateDirNaturalOrder(const std::wstring& dir) {
+    std::vector<std::wstring> out;
+    std::wstring pattern = dir;
+    if (!pattern.empty() && pattern.back() != L'\\') pattern += L'\\';
+    std::wstring base = pattern;
+    pattern += L'*';
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::wstring full = base + fd.cFileName;
+        if (IsSupportedImage(full)) out.push_back(std::move(full));
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    std::sort(out.begin(), out.end(), [](const std::wstring& a, const std::wstring& b) {
+        return StrCmpLogicalW(a.c_str(), b.c_str()) < 0;
+    });
+    return out;
+}
+
+DWORD WINAPI ListThreadProc(void* param) {
+    std::unique_ptr<ListReq> req(static_cast<ListReq*>(param));
+    HRESULT coInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    const std::wstring dir = req->isFolder ? req->target : ParentDir(req->target);
+    std::vector<std::wstring> files = ExplorerViewOrder(dir);
+    if (files.empty()) files = EnumerateDirNaturalOrder(dir);
+
+    int start = 0;
+    if (!req->isFolder) {
+        auto it = std::find_if(files.begin(), files.end(), [&](const std::wstring& f) {
+            return lstrcmpiW(f.c_str(), req->target.c_str()) == 0;
+        });
+        if (it != files.end()) {
+            start = (int)(it - files.begin());
+        } else {
+            files.push_back(req->target);
+            start = (int)files.size() - 1;
+        }
+    }
+    auto* done = new ListDone{req->gen, std::move(files), start};
+    if (!PostMessageW(req->hwnd, WM_APP_LIST, 0, reinterpret_cast<LPARAM>(done)))
+        delete done;
+    if (SUCCEEDED(coInit)) CoUninitialize();
+    return 0;
+}
+
+// ------------------------------------------------------------------- app state
+
+struct CacheEntry {
+    std::wstring key;
+    std::shared_ptr<DecodedImage> img;
+};
+
+struct Layout {
+    bool valid = false;
+    RECT imgArea{}, stripRc{};
+    double scale = 1.0;
+    double srcX = 0, srcY = 0, srcW = 0, srcH = 0;
+    RECT dest{};
+};
+
+struct UiRects {
+    bool barVisible = false, saveVisible = false, pageVisible = false;
+    RECT rotCcw{}, rotCw{}, save{}, bar{};
+    RECT pagePrev{}, pageNext{}, pageBar{};
+};
+
+struct App {
+    HWND hwnd = nullptr;
+    HACCEL accel = nullptr;
+    int dpi = 96;
+    HFONT fontUi = nullptr, fontSym = nullptr, fontBig = nullptr;
+    int fontDpi = 0;
+
+    std::vector<std::wstring> files;
+    int cur = -1;
+    UINT page = 0;
+    unsigned listGen = 0;
+    bool listPending = false;
+
+    std::shared_ptr<DecodedImage> disp; // current decoded image (unrotated)
+    int rot = 0;                        // view rotation, quarter turns CW
+    HBITMAP displayBmp = nullptr;       // rot applied + composited on bg
+    int dispW = 0, dispH = 0;
+    bool decodePending = false;
+    bool decodeFailed = false;
+    FILETIME lastWrite{};
+    bool savePending = false;
+
+    bool fitMode = true;
+    double zoom = 1.0;
+    double panX = 0, panY = 0;
+    bool interactive = false; // fast scaling during wheel/drag
+    bool dragging = false;
+    POINT dragStart{};
+    double dragPanX = 0, dragPanY = 0;
+
+    bool showDetails = false;
+    bool showFilmstrip = true;
+
+    std::vector<CacheEntry> cache; // tiny LRU of decoded images
+    DecodeWorker worker;
+    Filmstrip strip;
+};
+App g;
+
+std::wstring CacheKey(const std::wstring& path, UINT page) {
+    return path + L"|" + std::to_wstring(page);
+}
+
+std::shared_ptr<DecodedImage> CacheGet(const std::wstring& key) {
+    for (size_t i = 0; i < g.cache.size(); ++i) {
+        if (g.cache[i].key == key) {
+            CacheEntry e = g.cache[i];
+            g.cache.erase(g.cache.begin() + i);
+            g.cache.push_back(e);
+            return e.img;
+        }
+    }
+    return nullptr;
+}
+
+void CachePut(const std::wstring& key, std::shared_ptr<DecodedImage> img) {
+    for (size_t i = 0; i < g.cache.size(); ++i) {
+        if (g.cache[i].key == key) {
+            g.cache.erase(g.cache.begin() + i);
+            break;
+        }
+    }
+    g.cache.push_back({key, std::move(img)});
+    while (g.cache.size() > 4) g.cache.erase(g.cache.begin());
+}
+
+void CacheRemovePath(const std::wstring& path) {
+    const std::wstring prefix = path + L"|";
+    g.cache.erase(std::remove_if(g.cache.begin(), g.cache.end(),
+                                 [&](const CacheEntry& e) {
+                                     return e.key.compare(0, prefix.size(), prefix) == 0;
+                                 }),
+                  g.cache.end());
+}
+
+// ------------------------------------------------------------------ rendering
+
+std::vector<BYTE> RotateBgra(const std::vector<BYTE>& src, UINT w, UINT h, int q,
+                             UINT& outW, UINT& outH) {
+    outW = (q % 2) ? h : w;
+    outH = (q % 2) ? w : h;
+    std::vector<BYTE> dst(src.size());
+    const UINT32* s = reinterpret_cast<const UINT32*>(src.data());
+    UINT32* d = reinterpret_cast<UINT32*>(dst.data());
+    for (UINT ny = 0; ny < outH; ++ny) {
+        for (UINT nx = 0; nx < outW; ++nx) {
+            UINT ox, oy;
+            switch (q) {
+                case 1:  ox = ny;            oy = h - 1 - nx;  break; // 90 CW
+                case 2:  ox = w - 1 - nx;    oy = h - 1 - ny;  break;
+                default: ox = w - 1 - ny;    oy = nx;          break; // 270 CW
+            }
+            d[size_t(ny) * outW + nx] = s[size_t(oy) * w + ox];
+        }
+    }
+    return dst;
+}
+
+void RebuildDisplayBitmap() {
+    if (g.displayBmp) {
+        DeleteObject(g.displayBmp);
+        g.displayBmp = nullptr;
+    }
+    g.dispW = g.dispH = 0;
+    if (!g.disp || g.disp->bgra.empty()) return;
+
+    UINT w = g.disp->width, h = g.disp->height;
+    const std::vector<BYTE>* pixels = &g.disp->bgra;
+    std::vector<BYTE> rotated;
+    if (g.rot != 0) {
+        rotated = RotateBgra(g.disp->bgra, w, h, g.rot, w, h);
+        pixels = &rotated;
+    }
+
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = (LONG)w;
+    bi.bmiHeader.biHeight = -(LONG)h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC screen = GetDC(nullptr);
+    g.displayBmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, screen);
+    if (!g.displayBmp) return;
+
+    // Composite straight alpha over the background color once, so every
+    // subsequent blit is opaque and cheap.
+    const BYTE br = GetRValue(kBg), bgc = GetGValue(kBg), bb = GetBValue(kBg);
+    const BYTE* s = pixels->data();
+    BYTE* d = static_cast<BYTE*>(bits);
+    size_t count = size_t(w) * h;
+    for (size_t i = 0; i < count; ++i, s += 4, d += 4) {
+        BYTE a = s[3];
+        if (a == 255) {
+            d[0] = s[0]; d[1] = s[1]; d[2] = s[2];
+        } else {
+            d[0] = (BYTE)((s[0] * a + bb * (255 - a)) / 255);
+            d[1] = (BYTE)((s[1] * a + bgc * (255 - a)) / 255);
+            d[2] = (BYTE)((s[2] * a + br * (255 - a)) / 255);
+        }
+        d[3] = 255;
+    }
+    g.dispW = (int)w;
+    g.dispH = (int)h;
+}
+
+Layout ComputeLayout(const RECT& client) {
+    Layout L;
+    int stripH = g.showFilmstrip ? g.strip.Height(g.dpi) : 0;
+    L.imgArea = {0, 0, client.right, client.bottom - stripH};
+    L.stripRc = {0, L.imgArea.bottom, client.right, client.bottom};
+    if (!g.displayBmp || g.dispW <= 0 || g.dispH <= 0) return L;
+
+    const double areaW = (std::max)(1L, L.imgArea.right - L.imgArea.left);
+    const double areaH = (std::max)(1L, L.imgArea.bottom - L.imgArea.top);
+    const double fit = (std::min)(1.0, (std::min)(areaW / g.dispW, areaH / g.dispH));
+    L.scale = g.fitMode ? fit : g.zoom;
+
+    const double viewW = g.dispW * L.scale, viewH = g.dispH * L.scale;
+    if (viewW <= areaW) {
+        L.srcX = 0;
+        L.srcW = g.dispW;
+        L.dest.left = L.imgArea.left + (LONG)((areaW - viewW) / 2);
+        L.dest.right = L.dest.left + (LONG)viewW;
+        g.panX = 0;
+    } else {
+        const double maxPan = g.dispW - areaW / L.scale;
+        g.panX = (std::max)(0.0, (std::min)(g.panX, maxPan));
+        L.srcX = g.panX;
+        L.srcW = areaW / L.scale;
+        L.dest.left = L.imgArea.left;
+        L.dest.right = L.imgArea.right;
+    }
+    if (viewH <= areaH) {
+        L.srcY = 0;
+        L.srcH = g.dispH;
+        L.dest.top = L.imgArea.top + (LONG)((areaH - viewH) / 2);
+        L.dest.bottom = L.dest.top + (LONG)viewH;
+        g.panY = 0;
+    } else {
+        const double maxPan = g.dispH - areaH / L.scale;
+        g.panY = (std::max)(0.0, (std::min)(g.panY, maxPan));
+        L.srcY = g.panY;
+        L.srcH = areaH / L.scale;
+        L.dest.top = L.imgArea.top;
+        L.dest.bottom = L.imgArea.bottom;
+    }
+    L.valid = true;
+    return L;
+}
+
+int Scaled(int v) { return MulDiv(v, g.dpi, 96); }
+
+UiRects ComputeUiRects(const RECT& imgArea) {
+    UiRects r;
+    if (g.cur < 0) return r;
+    const int btnW = Scaled(44), btnH = Scaled(30), gap = Scaled(6), pad = Scaled(8);
+    const bool canSave = g.rot != 0 && g.disp && !g.savePending &&
+                         FindDecoder(g.files[g.cur]) &&
+                         FindDecoder(g.files[g.cur])->CanSaveRotation(g.files[g.cur], *g.disp);
+    r.saveVisible = canSave;
+    const int saveW = canSave ? Scaled(64) + gap : 0;
+    const int barW = 2 * btnW + gap + saveW + 2 * pad;
+    const int barH = btnH + 2 * pad;
+    const int cx = (imgArea.left + imgArea.right) / 2;
+    const int by = imgArea.bottom - Scaled(16) - barH;
+    r.bar = {cx - barW / 2, by, cx + barW / 2, by + barH};
+    r.rotCcw = {r.bar.left + pad, by + pad, r.bar.left + pad + btnW, by + pad + btnH};
+    r.rotCw = {r.rotCcw.right + gap, r.rotCcw.top, r.rotCcw.right + gap + btnW, r.rotCcw.bottom};
+    if (canSave)
+        r.save = {r.rotCw.right + gap, r.rotCw.top, r.rotCw.right + gap + Scaled(64), r.rotCw.bottom};
+    r.barVisible = g.disp != nullptr;
+
+    if (g.disp && g.disp->pageCount > 1) {
+        r.pageVisible = true;
+        const int pw = Scaled(180), ph = Scaled(30);
+        r.pageBar = {cx - pw / 2, imgArea.top + Scaled(12), cx + pw / 2,
+                     imgArea.top + Scaled(12) + ph};
+        r.pagePrev = {r.pageBar.left, r.pageBar.top, r.pageBar.left + Scaled(36), r.pageBar.bottom};
+        r.pageNext = {r.pageBar.right - Scaled(36), r.pageBar.top, r.pageBar.right, r.pageBar.bottom};
+    }
+    return r;
+}
+
+void EnsureFonts() {
+    if (g.fontDpi == g.dpi && g.fontUi) return;
+    if (g.fontUi) DeleteObject(g.fontUi);
+    if (g.fontSym) DeleteObject(g.fontSym);
+    if (g.fontBig) DeleteObject(g.fontBig);
+    g.fontUi = CreateFontW(-MulDiv(10, g.dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                           DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    g.fontSym = CreateFontW(-MulDiv(12, g.dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                            DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI Symbol");
+    g.fontBig = CreateFontW(-MulDiv(12, g.dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                            DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    g.fontDpi = g.dpi;
+}
+
+void DrawButton(HDC dc, const RECT& rc, const wchar_t* label, HFONT font) {
+    HBRUSH b = CreateSolidBrush(RGB(45, 45, 45));
+    FillRect(dc, &rc, b);
+    DeleteObject(b);
+    HBRUSH fr = CreateSolidBrush(kPanelBorder);
+    FrameRect(dc, &rc, fr);
+    DeleteObject(fr);
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    SetTextColor(dc, kText);
+    SetBkMode(dc, TRANSPARENT);
+    RECT t = rc;
+    DrawTextW(dc, label, -1, &t, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dc, oldFont);
+}
+
+void DrawCenteredText(HDC dc, const RECT& rc, const wchar_t* text) {
+    EnsureFonts();
+    HGDIOBJ oldFont = SelectObject(dc, g.fontBig);
+    SetTextColor(dc, kTextDim);
+    SetBkMode(dc, TRANSPARENT);
+    RECT t = rc;
+    DrawTextW(dc, text, -1, &t, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dc, oldFont);
+}
+
+std::vector<std::pair<std::wstring, std::wstring>> BuildDetails() {
+    std::vector<std::pair<std::wstring, std::wstring>> rows;
+    if (g.cur < 0) return rows;
+    const std::wstring& path = g.files[g.cur];
+    rows.emplace_back(L"Name", PathFindFileNameW(path.c_str()));
+    rows.emplace_back(L"Folder", ParentDir(path));
+
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+        ULARGE_INTEGER sz{};
+        sz.LowPart = fad.nFileSizeLow;
+        sz.HighPart = fad.nFileSizeHigh;
+        wchar_t buf[64];
+        StrFormatByteSizeW((LONGLONG)sz.QuadPart, buf, 64);
+        rows.emplace_back(L"Size", buf);
+        auto fmtTime = [](const FILETIME& ft) -> std::wstring {
+            FILETIME lft;
+            SYSTEMTIME st;
+            FileTimeToLocalFileTime(&ft, &lft);
+            FileTimeToSystemTime(&lft, &st);
+            wchar_t d[64], t[64];
+            GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &st, nullptr, d, 64, nullptr);
+            GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &st, nullptr, t, 64);
+            return std::wstring(d) + L" " + t;
+        };
+        rows.emplace_back(L"Created", fmtTime(fad.ftCreationTime));
+        rows.emplace_back(L"Modified", fmtTime(fad.ftLastWriteTime));
+    }
+    if (g.disp) {
+        wchar_t buf[64];
+        swprintf(buf, 64, L"%u x %u", g.disp->width, g.disp->height);
+        rows.emplace_back(L"Dimensions", buf);
+        if (g.disp->pageCount > 1) {
+            swprintf(buf, 64, L"%u / %u", g.page + 1, g.disp->pageCount);
+            rows.emplace_back(L"Page", buf);
+        }
+        for (const auto& m : g.disp->meta) rows.push_back(m);
+    }
+    return rows;
+}
+
+void Paint(HDC dcWin, const RECT& client) {
+    EnsureFonts();
+    const int cw = client.right, ch = client.bottom;
+    if (cw <= 0 || ch <= 0) return;
+    HDC dc = CreateCompatibleDC(dcWin);
+    HBITMAP back = CreateCompatibleBitmap(dcWin, cw, ch);
+    HGDIOBJ oldBack = SelectObject(dc, back);
+
+    Layout L = ComputeLayout(client);
+    HBRUSH bg = CreateSolidBrush(kBg);
+    FillRect(dc, &client, bg);
+    DeleteObject(bg);
+
+    if (L.valid) {
+        HDC mem = CreateCompatibleDC(dc);
+        HGDIOBJ old = SelectObject(mem, g.displayBmp);
+        SetStretchBltMode(dc, g.interactive ? COLORONCOLOR : HALFTONE);
+        SetBrushOrgEx(dc, 0, 0, nullptr);
+        StretchBlt(dc, L.dest.left, L.dest.top, L.dest.right - L.dest.left,
+                   L.dest.bottom - L.dest.top, mem, (int)L.srcX, (int)L.srcY,
+                   (int)L.srcW, (int)L.srcH, SRCCOPY);
+        SelectObject(mem, old);
+        DeleteDC(mem);
+    } else if (g.cur >= 0 && g.decodePending) {
+        // Blurry-then-sharp: show the filmstrip thumbnail while decoding.
+        HBITMAP thumb = g.strip.GetThumb(g.files[g.cur]);
+        if (thumb) {
+            BITMAP bm{};
+            GetObjectW(thumb, sizeof(bm), &bm);
+            double areaW = (std::max)(1L, L.imgArea.right - L.imgArea.left);
+            double areaH = (std::max)(1L, L.imgArea.bottom - L.imgArea.top);
+            double s = (std::min)(areaW / bm.bmWidth, areaH / bm.bmHeight);
+            int tw = (std::max)(1, (int)(bm.bmWidth * s));
+            int th = (std::max)(1, (int)(bm.bmHeight * s));
+            int tx = L.imgArea.left + ((int)areaW - tw) / 2;
+            int ty = L.imgArea.top + ((int)areaH - th) / 2;
+            HDC mem = CreateCompatibleDC(dc);
+            HGDIOBJ old = SelectObject(mem, thumb);
+            SetStretchBltMode(dc, HALFTONE);
+            SetBrushOrgEx(dc, 0, 0, nullptr);
+            StretchBlt(dc, tx, ty, tw, th, mem, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
+            SelectObject(mem, old);
+            DeleteDC(mem);
+        } else {
+            DrawCenteredText(dc, L.imgArea, L"Loading…");
+        }
+    } else if (g.cur >= 0 && g.decodeFailed) {
+        DrawCenteredText(dc, L.imgArea, L"Can't display this file.");
+    } else if (g.cur < 0) {
+        DrawCenteredText(dc, L.imgArea,
+                         g.listPending ? L"Loading…"
+                                       : L"Drop images or a folder here — or press Ctrl+O");
+    }
+
+    UiRects ui = ComputeUiRects(L.imgArea);
+    if (ui.barVisible) {
+        HBRUSH pb = CreateSolidBrush(kPanelBg);
+        FillRect(dc, &ui.bar, pb);
+        DeleteObject(pb);
+        HBRUSH fr = CreateSolidBrush(kPanelBorder);
+        FrameRect(dc, &ui.bar, fr);
+        DeleteObject(fr);
+        DrawButton(dc, ui.rotCcw, L"↺", g.fontSym);
+        DrawButton(dc, ui.rotCw, L"↻", g.fontSym);
+        if (ui.saveVisible) DrawButton(dc, ui.save, L"Save", g.fontUi);
+    }
+    if (ui.pageVisible) {
+        HBRUSH pb = CreateSolidBrush(kPanelBg);
+        FillRect(dc, &ui.pageBar, pb);
+        DeleteObject(pb);
+        HBRUSH fr = CreateSolidBrush(kPanelBorder);
+        FrameRect(dc, &ui.pageBar, fr);
+        DeleteObject(fr);
+        DrawButton(dc, ui.pagePrev, L"◀", g.fontSym);
+        DrawButton(dc, ui.pageNext, L"▶", g.fontSym);
+        wchar_t buf[32];
+        swprintf(buf, 32, L"%u / %u", g.page + 1, g.disp ? g.disp->pageCount : 1);
+        RECT mid = {ui.pagePrev.right, ui.pageBar.top, ui.pageNext.left, ui.pageBar.bottom};
+        HGDIOBJ oldFont = SelectObject(dc, g.fontUi);
+        SetTextColor(dc, kText);
+        SetBkMode(dc, TRANSPARENT);
+        DrawTextW(dc, buf, -1, &mid, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(dc, oldFont);
+    }
+
+    if (g.showDetails && g.cur >= 0) {
+        auto rows = BuildDetails();
+        const int pad = Scaled(12), lineH = Scaled(20), labelW = Scaled(100);
+        const int panelW = Scaled(380);
+        RECT panel = {L.imgArea.left + Scaled(12), L.imgArea.top + Scaled(12), 0, 0};
+        panel.right = panel.left + panelW;
+        panel.bottom = panel.top + 2 * pad + (int)rows.size() * lineH;
+        HBRUSH pb = CreateSolidBrush(kPanelBg);
+        FillRect(dc, &panel, pb);
+        DeleteObject(pb);
+        HBRUSH fr = CreateSolidBrush(kPanelBorder);
+        FrameRect(dc, &panel, fr);
+        DeleteObject(fr);
+        HGDIOBJ oldFont = SelectObject(dc, g.fontUi);
+        SetBkMode(dc, TRANSPARENT);
+        int y = panel.top + pad;
+        for (const auto& row : rows) {
+            SetTextColor(dc, kTextDim);
+            RECT lr = {panel.left + pad, y, panel.left + pad + labelW, y + lineH};
+            DrawTextW(dc, row.first.c_str(), -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            SetTextColor(dc, kText);
+            RECT vr = {lr.right + Scaled(6), y, panel.right - pad, y + lineH};
+            DrawTextW(dc, row.second.c_str(), -1, &vr,
+                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_PATH_ELLIPSIS);
+            y += lineH;
+        }
+        SelectObject(dc, oldFont);
+    }
+
+    if (g.showFilmstrip) g.strip.Draw(dc, L.stripRc);
+
+    BitBlt(dcWin, 0, 0, cw, ch, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, oldBack);
+    DeleteObject(back);
+    DeleteDC(dc);
+}
+
+// -------------------------------------------------------------------- actions
+
+RECT ClientRect() {
+    RECT rc;
+    GetClientRect(g.hwnd, &rc);
+    return rc;
+}
+
+void UpdateTitle() {
+    std::wstring t;
+    if (g.cur >= 0) {
+        t = PathFindFileNameW(g.files[g.cur].c_str());
+        if (g.rot != 0) t += L"*";
+        t += L" (" + std::to_wstring(g.cur + 1) + L"/" + std::to_wstring(g.files.size()) + L")";
+        t += L" — Photo Gallery";
+    } else {
+        t = L"Photo Gallery";
+    }
+    SetWindowTextW(g.hwnd, t.c_str());
+}
+
+void PrefetchNeighbors() {
+    const int n = (int)g.files.size();
+    if (n <= 1 || g.cur < 0) return;
+    for (int step : {1, -1}) {
+        int idx = ((g.cur + step) % n + n) % n;
+        if (idx == g.cur) continue;
+        if (!CacheGet(CacheKey(g.files[idx], 0)))
+            g.worker.RequestPrefetch(g.files[idx], 0);
+    }
+}
+
+void CaptureLastWrite(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad))
+        g.lastWrite = fad.ftLastWriteTime;
+    else
+        g.lastWrite = FILETIME{};
+}
+
+void LoadCurrent() {
+    g.disp.reset();
+    if (g.displayBmp) {
+        DeleteObject(g.displayBmp);
+        g.displayBmp = nullptr;
+    }
+    g.dispW = g.dispH = 0;
+    g.decodeFailed = false;
+    g.decodePending = false;
+
+    if (g.cur >= 0) {
+        const std::wstring& path = g.files[g.cur];
+        CaptureLastWrite(path);
+        if (auto img = CacheGet(CacheKey(path, g.page))) {
+            g.disp = img;
+            RebuildDisplayBitmap();
+            PrefetchNeighbors();
+        } else {
+            g.decodePending = true;
+            g.worker.RequestCurrent(path, g.page);
+        }
+        g.strip.SetCurrent(g.cur);
+    }
+    UpdateTitle();
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+
+// Offer to persist an unsaved rotation before leaving the image.
+void MaybeCommitRotation() {
+    if (g.rot == 0 || !g.disp || g.cur < 0) return;
+    const std::wstring& path = g.files[g.cur];
+    ImageDecoder* dec = FindDecoder(path);
+    if (dec && dec->CanSaveRotation(path, *g.disp)) {
+        std::wstring msg = L"Save the rotation to \"";
+        msg += PathFindFileNameW(path.c_str());
+        msg += L"\"?";
+        if (MessageBoxW(g.hwnd, msg.c_str(), L"Photo Gallery",
+                        MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            g.savePending = true;
+            g.worker.RequestSave(path, g.rot);
+        }
+    }
+    g.rot = 0;
+}
+
+void NavigateTo(int index, bool resetPage = true) {
+    if (g.files.empty()) return;
+    const int n = (int)g.files.size();
+    index = ((index % n) + n) % n;
+    MaybeCommitRotation();
+    g.cur = index;
+    if (resetPage) g.page = 0;
+    g.rot = 0;
+    g.fitMode = true;
+    LoadCurrent();
+}
+
+void SetPage(int page) {
+    if (!g.disp || g.disp->pageCount <= 1) return;
+    page = (std::max)(0, (std::min)(page, (int)g.disp->pageCount - 1));
+    if ((UINT)page == g.page) return;
+    g.page = (UINT)page;
+    g.rot = 0;
+    g.fitMode = true;
+    LoadCurrent();
+}
+
+void AdoptFileList(std::vector<std::wstring> files, int start) {
+    g.files = std::move(files);
+    g.strip.SetItems(&g.files);
+    g.cur = -1;
+    g.rot = 0;
+    if (!g.files.empty()) {
+        g.cur = (std::max)(0, (std::min)(start, (int)g.files.size() - 1));
+        g.page = 0;
+        g.fitMode = true;
+        LoadCurrent();
+    } else {
+        LoadCurrent();
+    }
+}
+
+bool CanonicalPath(const wchar_t* in, std::wstring& out) {
+    wchar_t buf[4096];
+    DWORD n = GetFullPathNameW(in, 4096, buf, nullptr);
+    if (n == 0 || n >= 4096) return false;
+    out = buf;
+    return true;
+}
+
+void StartListThread(const std::wstring& target, bool isFolder) {
+    g.listGen++;
+    g.listPending = true;
+    auto* req = new ListReq{g.hwnd, g.listGen, target, isFolder};
+    HANDLE h = CreateThread(nullptr, 0, ListThreadProc, req, 0, nullptr);
+    if (h)
+        CloseHandle(h);
+    else
+        delete req;
+}
+
+// Open a file or folder (command line, Ctrl+O, or drag & drop).
+void OpenTarget(const wchar_t* rawPath) {
+    std::wstring path;
+    if (!CanonicalPath(rawPath, path)) return;
+    DWORD attr = GetFileAttributesW(path.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) return;
+    while (path.size() > 3 && path.back() == L'\\') path.pop_back();
+
+    MaybeCommitRotation();
+    if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+        AdoptFileList({}, 0);
+        StartListThread(path, true);
+    } else {
+        if (!IsSupportedImage(path)) {
+            MessageBoxW(g.hwnd, L"This file type is not supported.", L"Photo Gallery",
+                        MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+        // Show the picked file immediately; siblings arrive asynchronously.
+        AdoptFileList({path}, 0);
+        StartListThread(path, false);
+    }
+}
+
+void OpenDialog() {
+    std::wstring filter = OpenDialogFilter();
+    wchar_t file[4096] = L"";
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g.hwnd;
+    ofn.lpstrFilter = filter.c_str();
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = 4096;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if (GetOpenFileNameW(&ofn)) OpenTarget(file);
+}
+
+void HandleDrop(HDROP drop) {
+    UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    std::vector<std::wstring> paths;
+    for (UINT i = 0; i < n; ++i) {
+        UINT len = DragQueryFileW(drop, i, nullptr, 0);
+        std::wstring p(len + 1, L'\0');
+        DragQueryFileW(drop, i, &p[0], len + 1);
+        p.resize(len);
+        std::wstring canon;
+        if (CanonicalPath(p.c_str(), canon)) paths.push_back(std::move(canon));
+    }
+    DragFinish(drop);
+    if (paths.empty()) return;
+
+    if (paths.size() == 1) {
+        OpenTarget(paths[0].c_str());
+        return;
+    }
+    // A dropped multi-selection becomes the navigation scope itself.
+    std::vector<std::wstring> images;
+    for (const auto& p : paths) {
+        DWORD attr = GetFileAttributesW(p.c_str());
+        if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY) &&
+            IsSupportedImage(p))
+            images.push_back(p);
+    }
+    if (images.empty()) {
+        MessageBoxW(g.hwnd, L"No supported images in the dropped items.", L"Photo Gallery",
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    std::sort(images.begin(), images.end(),
+              [](const std::wstring& a, const std::wstring& b) {
+                  return StrCmpLogicalW(a.c_str(), b.c_str()) < 0;
+              });
+    MaybeCommitRotation();
+    g.listGen++; // invalidate any in-flight folder scan
+    g.listPending = false;
+    AdoptFileList(std::move(images), 0);
+}
+
+void RotateView(int delta) {
+    if (!g.disp) return;
+    g.rot = ((g.rot + delta) % 4 + 4) % 4;
+    g.fitMode = true;
+    RebuildDisplayBitmap();
+    UpdateTitle();
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+
+void SaveRotationNow() {
+    if (g.rot == 0 || !g.disp || g.cur < 0 || g.savePending) return;
+    const std::wstring& path = g.files[g.cur];
+    ImageDecoder* dec = FindDecoder(path);
+    if (!dec || !dec->CanSaveRotation(path, *g.disp)) {
+        MessageBoxW(g.hwnd, L"Rotation can't be saved for this file type.", L"Photo Gallery",
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    g.savePending = true;
+    g.worker.RequestSave(path, g.rot);
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+
+void DeleteCurrent() {
+    if (g.cur < 0) return;
+    const std::wstring path = g.files[g.cur];
+
+    IFileOperation* op = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL,
+                                IID_IFileOperation, reinterpret_cast<void**>(&op))))
+        return;
+    bool deleted = false;
+    op->SetOwnerWindow(g.hwnd);
+    op->SetOperationFlags(FOF_ALLOWUNDO); // Recycle Bin, standard confirmations
+    IShellItem* item = nullptr;
+    if (SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_IShellItem,
+                                              reinterpret_cast<void**>(&item)))) {
+        if (SUCCEEDED(op->DeleteItem(item, nullptr)) &&
+            SUCCEEDED(op->PerformOperations())) {
+            BOOL aborted = FALSE;
+            op->GetAnyOperationsAborted(&aborted);
+            deleted = !aborted && GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES;
+        }
+        item->Release();
+    }
+    op->Release();
+    if (!deleted) return;
+
+    CacheRemovePath(path);
+    g.strip.InvalidateThumb(path);
+    g.rot = 0;
+    g.files.erase(g.files.begin() + g.cur);
+    if (g.files.empty()) {
+        g.cur = -1;
+        LoadCurrent();
+    } else {
+        g.cur = (std::min)(g.cur, (int)g.files.size() - 1);
+        g.page = 0;
+        g.fitMode = true;
+        LoadCurrent();
+    }
+}
+
+void EditInPaint() {
+    if (g.cur < 0) return;
+    MaybeCommitRotation();
+    UpdateTitle();
+    // Fixed executable, quoted path parameter — nothing user-controlled picks the app.
+    std::wstring params = L"\"" + g.files[g.cur] + L"\"";
+    ShellExecuteW(g.hwnd, L"open", L"mspaint.exe", params.c_str(), nullptr, SW_SHOWNORMAL);
+}
+
+void BeginInteractive() {
+    g.interactive = true;
+    SetTimer(g.hwnd, kTimerHq, 150, nullptr);
+}
+
+void ZoomAt(POINT anchor, double factor) {
+    RECT rc = ClientRect();
+    Layout L = ComputeLayout(rc);
+    if (!L.valid) return;
+    double oldScale = L.scale;
+    double newScale = (std::max)(kMinZoom, (std::min)(kMaxZoom, oldScale * factor));
+    if (std::fabs(newScale - oldScale) < 1e-9) return;
+    double imgX = L.srcX + (anchor.x - L.dest.left) / oldScale;
+    double imgY = L.srcY + (anchor.y - L.dest.top) / oldScale;
+    imgX = (std::max)(0.0, (std::min)(imgX, (double)g.dispW));
+    imgY = (std::max)(0.0, (std::min)(imgY, (double)g.dispH));
+    g.fitMode = false;
+    g.zoom = newScale;
+    g.panX = imgX - (anchor.x - L.imgArea.left) / newScale;
+    g.panY = imgY - (anchor.y - L.imgArea.top) / newScale;
+    BeginInteractive();
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+
+void ZoomStep(double factor) {
+    RECT rc = ClientRect();
+    Layout L = ComputeLayout(rc);
+    if (!L.valid) return;
+    POINT center = {(L.imgArea.left + L.imgArea.right) / 2,
+                    (L.imgArea.top + L.imgArea.bottom) / 2};
+    ZoomAt(center, factor);
+}
+
+void ReloadIfChangedOnDisk() {
+    if (g.cur < 0) return;
+    const std::wstring& path = g.files[g.cur];
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+        // Deleted or renamed externally.
+        CacheRemovePath(path);
+        g.strip.InvalidateThumb(path);
+        g.files.erase(g.files.begin() + g.cur);
+        g.rot = 0;
+        g.cur = g.files.empty() ? -1 : (std::min)(g.cur, (int)g.files.size() - 1);
+        LoadCurrent();
+        return;
+    }
+    if (CompareFileTime(&fad.ftLastWriteTime, &g.lastWrite) != 0) {
+        CacheRemovePath(path);
+        g.strip.InvalidateThumb(path);
+        LoadCurrent(); // rot intentionally kept: user may be mid-rotation
+    }
+}
+
+// ------------------------------------------------------------ message handlers
+
+void OnDecoded(DecodeDone* d) {
+    std::unique_ptr<DecodeDone> owner(d);
+    std::shared_ptr<DecodedImage> img(d->img);
+    const std::wstring key = CacheKey(d->path, d->page);
+    if (img) CachePut(key, img);
+    if (g.cur >= 0 && g.files[g.cur] == d->path && g.page == d->page) {
+        g.decodePending = false;
+        if (img) {
+            g.disp = img;
+            g.decodeFailed = false;
+            RebuildDisplayBitmap();
+            PrefetchNeighbors();
+        } else {
+            g.decodeFailed = true;
+        }
+        InvalidateRect(g.hwnd, nullptr, FALSE);
+        UpdateTitle();
+    }
+}
+
+void OnSaved(SaveDone* d) {
+    std::unique_ptr<SaveDone> owner(d);
+    g.savePending = false;
+    CacheRemovePath(d->path);
+    g.strip.InvalidateThumb(d->path);
+    if (!d->ok) {
+        MessageBoxW(g.hwnd, L"The rotation could not be saved.", L"Photo Gallery",
+                    MB_OK | MB_ICONWARNING);
+    }
+    if (g.cur >= 0 && g.files[g.cur] == d->path) {
+        if (d->ok) g.rot = 0; // file now matches the rotated view
+        LoadCurrent();
+    } else {
+        InvalidateRect(g.hwnd, nullptr, FALSE);
+    }
+}
+
+void OnListDone(ListDone* d) {
+    std::unique_ptr<ListDone> owner(d);
+    if (d->gen != g.listGen) return; // superseded by a newer open
+    g.listPending = false;
+    // Keep the currently shown file selected if it's in the new list.
+    int start = d->start;
+    if (g.cur >= 0 && !g.files.empty()) {
+        const std::wstring& shown = g.files[g.cur];
+        for (size_t i = 0; i < d->files.size(); ++i) {
+            if (lstrcmpiW(d->files[i].c_str(), shown.c_str()) == 0) {
+                start = (int)i;
+                break;
+            }
+        }
+    }
+    // Adopt without disturbing the already-decoding current image.
+    std::wstring shownPath = (g.cur >= 0) ? g.files[g.cur] : L"";
+    g.files = std::move(d->files);
+    g.strip.SetItems(&g.files);
+    if (g.files.empty()) {
+        g.cur = -1;
+        LoadCurrent();
+        return;
+    }
+    start = (std::max)(0, (std::min)(start, (int)g.files.size() - 1));
+    g.cur = start;
+    g.strip.SetCurrent(g.cur);
+    if (shownPath.empty() || lstrcmpiW(g.files[g.cur].c_str(), shownPath.c_str()) != 0) {
+        g.page = 0;
+        g.rot = 0;
+        g.fitMode = true;
+        LoadCurrent();
+    } else {
+        PrefetchNeighbors();
+        UpdateTitle();
+        InvalidateRect(g.hwnd, nullptr, FALSE);
+    }
+}
+
+void OnCommand(WORD id) {
+    switch (id) {
+        case IDM_OPEN: OpenDialog(); break;
+        case IDM_EXIT: PostMessageW(g.hwnd, WM_CLOSE, 0, 0); break;
+        case IDM_EDIT_PAINT: EditInPaint(); break;
+        case IDM_DELETE: DeleteCurrent(); break;
+        case IDM_ROTATE_CW: RotateView(1); break;
+        case IDM_ROTATE_CCW: RotateView(-1); break;
+        case IDM_SAVE: SaveRotationNow(); break;
+        case IDM_DETAILS:
+            g.showDetails = !g.showDetails;
+            InvalidateRect(g.hwnd, nullptr, FALSE);
+            break;
+        case IDM_FILMSTRIP:
+            g.showFilmstrip = !g.showFilmstrip;
+            InvalidateRect(g.hwnd, nullptr, FALSE);
+            break;
+        case IDM_ZOOMIN: ZoomStep(1.25); break;
+        case IDM_ZOOMOUT: ZoomStep(1.0 / 1.25); break;
+        case IDM_FIT:
+            g.fitMode = true;
+            InvalidateRect(g.hwnd, nullptr, FALSE);
+            break;
+        case IDM_NEXT:
+            if (!g.files.empty()) NavigateTo(g.cur + 1);
+            break;
+        case IDM_PREV:
+            if (!g.files.empty()) NavigateTo(g.cur - 1);
+            break;
+        case IDM_PAGE_NEXT: SetPage((int)g.page + 1); break;
+        case IDM_PAGE_PREV: SetPage((int)g.page - 1); break;
+        default: break;
+    }
+}
+
+void OnInitMenuPopup(HMENU menu) {
+    const bool haveImage = g.cur >= 0;
+    const bool haveDisp = g.disp != nullptr;
+    auto enable = [&](UINT id, bool on) {
+        EnableMenuItem(menu, id, MF_BYCOMMAND | (on ? MF_ENABLED : MF_GRAYED));
+    };
+    enable(IDM_EDIT_PAINT, haveImage);
+    enable(IDM_DELETE, haveImage);
+    enable(IDM_ROTATE_CW, haveDisp);
+    enable(IDM_ROTATE_CCW, haveDisp);
+    enable(IDM_SAVE, haveDisp && g.rot != 0 && !g.savePending);
+    enable(IDM_ZOOMIN, haveDisp);
+    enable(IDM_ZOOMOUT, haveDisp);
+    enable(IDM_FIT, haveDisp);
+    enable(IDM_NEXT, g.files.size() > 1);
+    enable(IDM_PREV, g.files.size() > 1);
+    enable(IDM_PAGE_NEXT, haveDisp && g.disp->pageCount > 1);
+    enable(IDM_PAGE_PREV, haveDisp && g.disp->pageCount > 1);
+    CheckMenuItem(menu, IDM_DETAILS,
+                  MF_BYCOMMAND | (g.showDetails ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, IDM_FILMSTRIP,
+                  MF_BYCOMMAND | (g.showFilmstrip ? MF_CHECKED : MF_UNCHECKED));
+}
+
+void OnLButtonDown(POINT pt) {
+    RECT rc = ClientRect();
+    Layout L = ComputeLayout(rc);
+    UiRects ui = ComputeUiRects(L.imgArea);
+
+    if (ui.barVisible && PtInRect(&ui.rotCcw, pt)) { RotateView(-1); return; }
+    if (ui.barVisible && PtInRect(&ui.rotCw, pt)) { RotateView(1); return; }
+    if (ui.barVisible && ui.saveVisible && PtInRect(&ui.save, pt)) { SaveRotationNow(); return; }
+    if (ui.pageVisible && PtInRect(&ui.pagePrev, pt)) { SetPage((int)g.page - 1); return; }
+    if (ui.pageVisible && PtInRect(&ui.pageNext, pt)) { SetPage((int)g.page + 1); return; }
+
+    if (g.showFilmstrip && PtInRect(&L.stripRc, pt)) {
+        int idx = g.strip.HitTest(pt, L.stripRc);
+        if (idx >= 0 && idx != g.cur) NavigateTo(idx);
+        return;
+    }
+
+    if (L.valid && PtInRect(&L.imgArea, pt)) {
+        // Pan only when the image overflows the viewport.
+        const double areaW = L.imgArea.right - L.imgArea.left;
+        const double areaH = L.imgArea.bottom - L.imgArea.top;
+        if (g.dispW * L.scale > areaW || g.dispH * L.scale > areaH) {
+            g.dragging = true;
+            g.dragStart = pt;
+            g.dragPanX = g.panX;
+            g.dragPanY = g.panY;
+            SetCapture(g.hwnd);
+        }
+    }
+}
+
+void OnMouseMove(POINT pt) {
+    if (!g.dragging) return;
+    RECT rc = ClientRect();
+    Layout L = ComputeLayout(rc);
+    if (!L.valid) return;
+    g.panX = g.dragPanX - (pt.x - g.dragStart.x) / L.scale;
+    g.panY = g.dragPanY - (pt.y - g.dragStart.y) / L.scale;
+    BeginInteractive();
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+
+void OnMouseWheel(POINT screenPt, int delta) {
+    POINT pt = screenPt;
+    ScreenToClient(g.hwnd, &pt);
+    RECT rc = ClientRect();
+    Layout L = ComputeLayout(rc);
+    if (g.showFilmstrip && PtInRect(&L.stripRc, pt)) {
+        g.strip.Scroll(delta);
+        InvalidateRect(g.hwnd, nullptr, FALSE);
+        return;
+    }
+    ZoomAt(pt, std::pow(1.25, delta / 120.0));
+}
+
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hwnd, &ps);
+            Paint(dc, ClientRect());
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_SIZE:
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        case WM_GETMINMAXINFO: {
+            MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+            mmi->ptMinTrackSize = {480, 360};
+            return 0;
+        }
+        case WM_COMMAND:
+            OnCommand(LOWORD(wParam));
+            return 0;
+        case WM_INITMENUPOPUP:
+            OnInitMenuPopup(reinterpret_cast<HMENU>(wParam));
+            return 0;
+        case WM_LBUTTONDOWN:
+            OnLButtonDown({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
+            return 0;
+        case WM_MOUSEMOVE:
+            OnMouseMove({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)});
+            return 0;
+        case WM_LBUTTONUP:
+            if (g.dragging) {
+                g.dragging = false;
+                ReleaseCapture();
+            }
+            return 0;
+        case WM_MOUSEWHEEL:
+            OnMouseWheel({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)},
+                         GET_WHEEL_DELTA_WPARAM(wParam));
+            return 0;
+        case WM_TIMER:
+            if (wParam == kTimerHq) {
+                KillTimer(hwnd, kTimerHq);
+                g.interactive = false;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        case WM_DROPFILES:
+            HandleDrop(reinterpret_cast<HDROP>(wParam));
+            return 0;
+        case WM_ACTIVATEAPP:
+            if (wParam) ReloadIfChangedOnDisk();
+            return 0;
+        case WM_DPICHANGED: {
+            g.dpi = HIWORD(wParam);
+            const RECT* r = reinterpret_cast<const RECT*>(lParam);
+            SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left,
+                         r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        case WM_APP_DECODED:
+            OnDecoded(reinterpret_cast<DecodeDone*>(lParam));
+            return 0;
+        case WM_APP_SAVED:
+            OnSaved(reinterpret_cast<SaveDone*>(lParam));
+            return 0;
+        case WM_APP_LIST:
+            OnListDone(reinterpret_cast<ListDone*>(lParam));
+            return 0;
+        case WM_APP_THUMB: {
+            auto* r = reinterpret_cast<Filmstrip::ThumbResult*>(lParam);
+            g.strip.OnThumbReady(r);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        case WM_CLOSE:
+            // Last chance to persist an unsaved rotation (synchronous: we're exiting).
+            if (g.rot != 0 && g.disp && g.cur >= 0) {
+                const std::wstring& path = g.files[g.cur];
+                ImageDecoder* dec = FindDecoder(path);
+                if (dec && dec->CanSaveRotation(path, *g.disp)) {
+                    std::wstring m = L"Save the rotation to \"";
+                    m += PathFindFileNameW(path.c_str());
+                    m += L"\" before closing?";
+                    if (MessageBoxW(hwnd, m.c_str(), L"Photo Gallery",
+                                    MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                        HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+                        dec->SaveRotation(path, g.rot);
+                        SetCursor(old);
+                    }
+                }
+                g.rot = 0;
+            }
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+        default:
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+}
+
+} // namespace
+
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
+    HeapSetInformation(nullptr, HeapEnableTerminationOnCorruption, nullptr, 0);
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)))
+        return 1;
+    InitDecoders();
+
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.lpszMenuName = MAKEINTRESOURCEW(IDR_MAINMENU);
+    wc.lpszClassName = L"PhotoGalleryWnd";
+    if (!RegisterClassExW(&wc)) return 1;
+
+    g.hwnd = CreateWindowExW(0, wc.lpszClassName, L"Photo Gallery",
+                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                             1100, 800, nullptr, nullptr, hInst, nullptr);
+    if (!g.hwnd) return 1;
+    g.dpi = (int)GetDpiForWindow(g.hwnd);
+    g.accel = LoadAcceleratorsW(hInst, MAKEINTRESOURCEW(IDR_ACCEL));
+    DragAcceptFiles(g.hwnd, TRUE);
+
+    g.worker.Start(g.hwnd);
+    g.strip.Start(g.hwnd, WM_APP_THUMB);
+    g.strip.SetItems(&g.files);
+
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv) {
+        if (argc > 1) OpenTarget(argv[1]);
+        LocalFree(argv);
+    }
+
+    ShowWindow(g.hwnd, nCmdShow);
+    UpdateTitle();
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (g.accel && TranslateAcceleratorW(g.hwnd, g.accel, &msg)) continue;
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    g.worker.Stop();
+    g.strip.Stop();
+    if (g.displayBmp) DeleteObject(g.displayBmp);
+    if (g.fontUi) DeleteObject(g.fontUi);
+    if (g.fontSym) DeleteObject(g.fontSym);
+    if (g.fontBig) DeleteObject(g.fontBig);
+    g.cache.clear();
+    g.disp.reset();
+    ShutdownDecoders();
+    CoUninitialize();
+    return (int)msg.wParam;
+}
