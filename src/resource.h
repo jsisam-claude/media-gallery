@@ -19,3 +19,4 @@
 #define IDM_PREV            40014
 #define IDM_PAGE_NEXT       40015
 #define IDM_PAGE_PREV       40016
+#define IDM_GRID            40017

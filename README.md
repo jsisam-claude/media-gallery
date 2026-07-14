@@ -17,6 +17,11 @@ Update. Runs on stock Windows 10 and 11.
   sort (`StrCmpLogicalW`).
 - **Filmstrip:** thumbnail ribbon (Explorer's own thumbnail pipeline) along the
   bottom; click a thumbnail to jump to it.
+- **Thumbnail grid:** `G` switches to a full-window grid of the whole folder —
+  8 columns by default; `Ctrl` `+`/`-` or Ctrl+wheel zoom the grid (8×8 → 4×4 →
+  2×2 → 1, bigger cells fetch sharper thumbnails), wheel scrolls, arrows move
+  the selection, click or `Enter` opens the image, `Del` deletes the selected
+  one, `Esc`/`G` returns to the viewer.
 - **Zoom & pan:** mouse wheel zooms at the cursor, `Ctrl` `+`/`-` step zoom,
   `Ctrl+0` fit; drag to pan when zoomed in. Aspect ratio is always preserved;
   small images display at 100%, never stretched.
@@ -48,6 +53,7 @@ Update. Runs on stock Windows 10 and 11.
 | `E` | Edit in Paint |
 | `I` / `Alt+Enter` | Details pane |
 | `T` | Toggle filmstrip |
+| `G` | Thumbnail grid view (arrows select, `Enter`/click opens, `Ctrl` `+`/`-` or Ctrl+wheel changes density, `Esc` returns) |
 | `Ctrl+O` | Open… |
 | `Esc` | Exit |
 

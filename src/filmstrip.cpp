@@ -53,25 +53,31 @@ HBITMAP ThumbFromDecoded(const DecodedImage& img, int maxSide) {
     return hbmp;
 }
 
-HBITMAP LoadShellThumb(const std::wstring& path) {
+HBITMAP LoadShellThumb(const std::wstring& path, int px) {
     IShellItemImageFactory* f = nullptr;
     HBITMAP hbmp = nullptr;
     if (SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr,
                                               IID_IShellItemImageFactory,
                                               reinterpret_cast<void**>(&f)))) {
-        SIZE sz{256, 256};
+        SIZE sz{px, px};
         if (FAILED(f->GetImage(sz, SIIGBF_RESIZETOFIT, &hbmp))) hbmp = nullptr;
         f->Release();
     }
     if (!hbmp) {
         if (ImageDecoder* d = FindDecoder(path)) {
-            if (auto img = d->Load(path, 0)) hbmp = ThumbFromDecoded(*img, 256);
+            if (auto img = d->Load(path, 0)) hbmp = ThumbFromDecoded(*img, px);
         }
     }
     return hbmp;
 }
 
 } // namespace
+
+int Filmstrip::SizeClassFor(int cellPx) {
+    for (int s : kSizes)
+        if (cellPx <= s) return s;
+    return kSizes[2];
+}
 
 void Filmstrip::Start(HWND owner, UINT readyMsg) {
     owner_ = owner;
@@ -111,12 +117,13 @@ void Filmstrip::WorkerLoop() {
             LeaveCriticalSection(&cs_);
             break;
         }
-        std::wstring path = std::move(queue_.front());
+        std::wstring path = std::move(queue_.front().first);
+        int px = queue_.front().second;
         queue_.pop_front();
         LeaveCriticalSection(&cs_);
 
-        HBITMAP hbmp = LoadShellThumb(path);
-        auto* r = new ThumbResult{std::move(path), hbmp};
+        HBITMAP hbmp = LoadShellThumb(path, px);
+        auto* r = new ThumbResult{std::move(path), px, hbmp};
         if (!PostMessageW(owner_, readyMsg_, 0, reinterpret_cast<LPARAM>(r))) {
             if (r->bmp) DeleteObject(r->bmp);
             delete r;
@@ -137,25 +144,37 @@ void Filmstrip::SetCurrent(int index) {
 }
 
 void Filmstrip::InvalidateThumb(const std::wstring& path) {
-    auto it = cache_.find(path);
-    if (it != cache_.end()) {
-        if (it->second) DeleteObject(it->second);
-        cache_.erase(it);
+    for (int s : kSizes) {
+        const std::wstring key = Key(path, s);
+        auto it = cache_.find(key);
+        if (it != cache_.end()) {
+            if (it->second) DeleteObject(it->second);
+            cache_.erase(it);
+        }
+        requested_.erase(key);
     }
-    requested_.erase(path);
 }
 
 void Filmstrip::OnThumbReady(ThumbResult* r) {
     EvictIfNeeded();
-    auto it = cache_.find(r->path);
+    const std::wstring key = Key(r->path, r->px);
+    auto it = cache_.find(key);
     if (it != cache_.end() && it->second) DeleteObject(it->second);
-    cache_[r->path] = r->bmp; // may be null: remembered as failed, no re-request
+    cache_[key] = r->bmp; // may be null: remembered as failed, no re-request
     delete r;
 }
 
-HBITMAP Filmstrip::GetThumb(const std::wstring& path) const {
-    auto it = cache_.find(path);
+HBITMAP Filmstrip::GetThumb(const std::wstring& path, int px) const {
+    auto it = cache_.find(Key(path, px));
     return it != cache_.end() ? it->second : nullptr;
+}
+
+HBITMAP Filmstrip::GetThumbAny(const std::wstring& path) const {
+    for (int i = 2; i >= 0; --i) { // prefer the largest loaded class
+        auto it = cache_.find(Key(path, kSizes[i]));
+        if (it != cache_.end() && it->second) return it->second;
+    }
+    return nullptr;
 }
 
 void Filmstrip::EvictIfNeeded() {
@@ -166,11 +185,12 @@ void Filmstrip::EvictIfNeeded() {
     requested_.clear();
 }
 
-void Filmstrip::Request(const std::wstring& path) {
-    if (requested_.count(path)) return;
-    requested_[path] = true;
+void Filmstrip::Request(const std::wstring& path, int px) {
+    const std::wstring key = Key(path, px);
+    if (requested_.count(key)) return;
+    requested_[key] = true;
     EnterCriticalSection(&cs_);
-    queue_.push_back(path);
+    queue_.emplace_back(path, px);
     LeaveCriticalSection(&cs_);
     WakeConditionVariable(&cv_);
 }
@@ -225,16 +245,16 @@ void Filmstrip::Draw(HDC dc, const RECT& rc) {
         cellRc.right = cellRc.left + cell;
         cellRc.bottom = cellRc.top + cell;
 
-        auto it = cache_.find(path);
-        if (it == cache_.end()) Request(path);
+        if (!GetThumb(path, kSizes[0]) &&
+            !requested_.count(Key(path, kSizes[0])))
+            Request(path, kSizes[0]);
 
-        HBITMAP thumb = (it != cache_.end()) ? it->second : nullptr;
+        HBITMAP thumb = GetThumbAny(path);
         if (thumb) {
             BITMAP bm{};
             GetObjectW(thumb, sizeof(bm), &bm);
             // Letterbox: center the (aspect-preserved) thumbnail in the cell.
             double s = (std::min)((double)cell / bm.bmWidth, (double)cell / bm.bmHeight);
-            if (s > 1.0) s = 1.0;
             int tw = (std::max)(1, (int)(bm.bmWidth * s));
             int th = (std::max)(1, (int)(bm.bmHeight * s));
             int tx = cellRc.left + (cell - tw) / 2;

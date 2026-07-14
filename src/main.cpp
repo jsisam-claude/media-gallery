@@ -330,6 +330,11 @@ struct App {
     bool showDetails = false;
     bool showFilmstrip = true;
 
+    bool gridMode = false; // full-window thumbnail grid
+    int gridCols = 8;      // 16..1, halves/doubles on zoom
+    int gridScroll = 0;    // vertical scroll, pixels
+    int gridSel = 0;       // keyboard selection in the grid
+
     std::vector<CacheEntry> cache; // tiny LRU of decoded images
     DecodeWorker worker;
     Filmstrip strip;
@@ -492,6 +497,162 @@ Layout ComputeLayout(const RECT& client) {
 
 int Scaled(int v) { return MulDiv(v, g.dpi, 96); }
 
+// ------------------------------------------------------------------ grid view
+
+RECT ClientRect(); // fwd decls (defined below)
+void DrawCenteredText(HDC dc, const RECT& rc, const wchar_t* text);
+
+struct GridLayout {
+    int cols = 1, cell = 1, rows = 0, contentH = 0;
+    RECT area{};
+};
+
+GridLayout ComputeGrid(const RECT& client) {
+    GridLayout gl;
+    gl.area = client;
+    gl.cols = (std::max)(1, g.gridCols);
+    gl.cell = (std::max)(1L, client.right - client.left) / gl.cols;
+    if (gl.cell < 1) gl.cell = 1;
+    const int n = (int)g.files.size();
+    gl.rows = (n + gl.cols - 1) / gl.cols;
+    gl.contentH = gl.rows * gl.cell;
+    const int viewH = client.bottom - client.top;
+    g.gridScroll = (std::max)(0, (std::min)(g.gridScroll, gl.contentH - viewH));
+    return gl;
+}
+
+RECT GridCellRect(const GridLayout& gl, int index) {
+    const int row = index / gl.cols, col = index % gl.cols;
+    RECT rc;
+    rc.left = gl.area.left + col * gl.cell;
+    rc.top = gl.area.top + row * gl.cell - g.gridScroll;
+    rc.right = rc.left + gl.cell;
+    rc.bottom = rc.top + gl.cell;
+    return rc;
+}
+
+void GridEnsureVisible() {
+    RECT client = ClientRect();
+    GridLayout gl = ComputeGrid(client);
+    if (g.files.empty()) return;
+    g.gridSel = (std::max)(0, (std::min)(g.gridSel, (int)g.files.size() - 1));
+    const int rowTop = (g.gridSel / gl.cols) * gl.cell;
+    const int viewH = client.bottom - client.top;
+    if (rowTop < g.gridScroll) g.gridScroll = rowTop;
+    else if (rowTop + gl.cell > g.gridScroll + viewH)
+        g.gridScroll = rowTop + gl.cell - viewH;
+    if (g.gridScroll < 0) g.gridScroll = 0;
+}
+
+void ToggleGrid() {
+    g.gridMode = !g.gridMode;
+    if (g.gridMode) {
+        g.gridSel = (std::max)(0, g.cur);
+        GridEnsureVisible();
+    }
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+
+void GridMoveSel(int delta) {
+    if (g.files.empty()) return;
+    int sel = g.gridSel + delta;
+    sel = (std::max)(0, (std::min)(sel, (int)g.files.size() - 1));
+    if (sel == g.gridSel) return;
+    g.gridSel = sel;
+    GridEnsureVisible();
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+
+// Zoom in = bigger cells = fewer columns (16 -> 8 -> 4 -> 2 -> 1).
+void GridZoom(bool in) {
+    int cols = g.gridCols;
+    cols = in ? cols / 2 : cols * 2;
+    cols = (std::max)(1, (std::min)(cols, 16));
+    if (cols == g.gridCols) return;
+    g.gridCols = cols;
+    GridEnsureVisible();
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+
+void NavigateTo(int index, bool resetPage); // fwd decl (defined below)
+
+void OpenFromGrid(int index) {
+    if (index < 0 || index >= (int)g.files.size()) return;
+    g.gridMode = false;
+    NavigateTo(index, true);
+}
+
+int GridHitTest(POINT pt, const GridLayout& gl) {
+    if (pt.x < gl.area.left || pt.x >= gl.area.right) return -1;
+    const int col = (pt.x - gl.area.left) / gl.cell;
+    if (col >= gl.cols) return -1;
+    const int row = (pt.y - gl.area.top + g.gridScroll) / gl.cell;
+    if (row < 0) return -1;
+    const int idx = row * gl.cols + col;
+    return (idx < (int)g.files.size()) ? idx : -1;
+}
+
+void PaintGrid(HDC dc, const RECT& client) {
+    GridLayout gl = ComputeGrid(client);
+    if (g.files.empty()) {
+        DrawCenteredText(dc, client,
+                         g.listPending ? L"Loading…"
+                                       : L"Drop images or a folder here — or press Ctrl+O");
+        return;
+    }
+    const int viewH = client.bottom - client.top;
+    const int firstRow = g.gridScroll / gl.cell;
+    const int lastRow = (std::min)(gl.rows - 1, (g.gridScroll + viewH) / gl.cell);
+    const int pad = (std::max)(2, gl.cell / 32);
+    const int thumbClass = Filmstrip::SizeClassFor(gl.cell);
+
+    HDC mem = CreateCompatibleDC(dc);
+    for (int row = firstRow; row <= lastRow; ++row) {
+        for (int col = 0; col < gl.cols; ++col) {
+            const int i = row * gl.cols + col;
+            if (i >= (int)g.files.size()) break;
+            const std::wstring& path = g.files[i];
+            RECT cellRc = GridCellRect(gl, i);
+            InflateRect(&cellRc, -pad, -pad);
+
+            if (!g.strip.GetThumb(path, thumbClass))
+                g.strip.Request(path, thumbClass);
+            HBITMAP thumb = g.strip.GetThumbAny(path);
+            if (thumb) {
+                BITMAP bm{};
+                GetObjectW(thumb, sizeof(bm), &bm);
+                const int cw = cellRc.right - cellRc.left;
+                const int chh = cellRc.bottom - cellRc.top;
+                double s = (std::min)((double)cw / bm.bmWidth, (double)chh / bm.bmHeight);
+                int tw = (std::max)(1, (int)(bm.bmWidth * s));
+                int th = (std::max)(1, (int)(bm.bmHeight * s));
+                int tx = cellRc.left + (cw - tw) / 2;
+                int ty = cellRc.top + (chh - th) / 2;
+                HGDIOBJ old = SelectObject(mem, thumb);
+                SetStretchBltMode(dc, HALFTONE);
+                SetBrushOrgEx(dc, 0, 0, nullptr);
+                StretchBlt(dc, tx, ty, tw, th, mem, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
+                SelectObject(mem, old);
+            } else {
+                HBRUSH ph = CreateSolidBrush(RGB(46, 46, 46));
+                FillRect(dc, &cellRc, ph);
+                DeleteObject(ph);
+            }
+
+            if (i == g.gridSel) {
+                HBRUSH hl = CreateSolidBrush(kAccent);
+                RECT b = cellRc;
+                InflateRect(&b, pad / 2 + 2, pad / 2 + 2);
+                FrameRect(dc, &b, hl);
+                InflateRect(&b, -1, -1);
+                FrameRect(dc, &b, hl);
+                DeleteObject(hl);
+            }
+        }
+    }
+    DeleteDC(mem);
+}
+
 UiRects ComputeUiRects(const RECT& imgArea) {
     UiRects r;
     if (g.cur < 0) return r;
@@ -611,11 +772,20 @@ void Paint(HDC dcWin, const RECT& client) {
     HBITMAP back = CreateCompatibleBitmap(dcWin, cw, ch);
     HGDIOBJ oldBack = SelectObject(dc, back);
 
-    Layout L = ComputeLayout(client);
     HBRUSH bg = CreateSolidBrush(kBg);
     FillRect(dc, &client, bg);
     DeleteObject(bg);
 
+    if (g.gridMode) {
+        PaintGrid(dc, client);
+        BitBlt(dcWin, 0, 0, cw, ch, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, oldBack);
+        DeleteObject(back);
+        DeleteDC(dc);
+        return;
+    }
+
+    Layout L = ComputeLayout(client);
     if (L.valid) {
         HDC mem = CreateCompatibleDC(dc);
         HGDIOBJ old = SelectObject(mem, g.displayBmp);
@@ -628,7 +798,7 @@ void Paint(HDC dcWin, const RECT& client) {
         DeleteDC(mem);
     } else if (g.cur >= 0 && g.decodePending) {
         // Blurry-then-sharp: show the filmstrip thumbnail while decoding.
-        HBITMAP thumb = g.strip.GetThumb(g.files[g.cur]);
+        HBITMAP thumb = g.strip.GetThumbAny(g.files[g.cur]);
         if (thumb) {
             BITMAP bm{};
             GetObjectW(thumb, sizeof(bm), &bm);
@@ -837,6 +1007,8 @@ void AdoptFileList(std::vector<std::wstring> files, int start) {
     g.strip.SetItems(&g.files);
     g.cur = -1;
     g.rot = 0;
+    g.gridScroll = 0;
+    g.gridSel = (std::max)(0, (std::min)(start, (int)g.files.size() - 1));
     if (!g.files.empty()) {
         g.cur = (std::max)(0, (std::min)(start, (int)g.files.size() - 1));
         g.page = 0;
@@ -967,9 +1139,9 @@ void SaveRotationNow() {
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 
-void DeleteCurrent() {
-    if (g.cur < 0) return;
-    const std::wstring path = g.files[g.cur];
+void DeleteAt(int index) {
+    if (index < 0 || index >= (int)g.files.size()) return;
+    const std::wstring path = g.files[index];
 
     IFileOperation* op = nullptr;
     if (FAILED(CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL,
@@ -994,25 +1166,37 @@ void DeleteCurrent() {
 
     CacheRemovePath(path);
     g.strip.InvalidateThumb(path);
-    g.rot = 0;
-    g.files.erase(g.files.begin() + g.cur);
+    if (index == g.cur) g.rot = 0;
+    g.files.erase(g.files.begin() + index);
     if (g.files.empty()) {
         g.cur = -1;
+        g.gridSel = 0;
         LoadCurrent();
-    } else {
+        return;
+    }
+    if (index < g.cur) {
+        g.cur--; // list shifted under the shown image; nothing to reload
+        g.strip.SetCurrent(g.cur);
+        UpdateTitle();
+    } else if (index == g.cur) {
         g.cur = (std::min)(g.cur, (int)g.files.size() - 1);
         g.page = 0;
         g.fitMode = true;
         LoadCurrent();
     }
+    g.gridSel = (std::max)(0, (std::min)(index, (int)g.files.size() - 1));
+    if (g.gridMode) GridEnsureVisible();
+    InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 
-void EditInPaint() {
-    if (g.cur < 0) return;
-    MaybeCommitRotation();
-    UpdateTitle();
+void EditInPaint(int index) {
+    if (index < 0 || index >= (int)g.files.size()) return;
+    if (index == g.cur) {
+        MaybeCommitRotation();
+        UpdateTitle();
+    }
     // Fixed executable, quoted path parameter — nothing user-controlled picks the app.
-    std::wstring params = L"\"" + g.files[g.cur] + L"\"";
+    std::wstring params = L"\"" + g.files[index] + L"\"";
     ShellExecuteW(g.hwnd, L"open", L"mspaint.exe", params.c_str(), nullptr, SW_SHOWNORMAL);
 }
 
@@ -1135,6 +1319,8 @@ void OnListDone(ListDone* d) {
     }
     start = (std::max)(0, (std::min)(start, (int)g.files.size() - 1));
     g.cur = start;
+    g.gridSel = start;
+    if (g.gridMode) GridEnsureVisible();
     g.strip.SetCurrent(g.cur);
     if (shownPath.empty() || lstrcmpiW(g.files[g.cur].c_str(), shownPath.c_str()) != 0) {
         g.page = 0;
@@ -1151,12 +1337,21 @@ void OnListDone(ListDone* d) {
 void OnCommand(WORD id) {
     switch (id) {
         case IDM_OPEN: OpenDialog(); break;
-        case IDM_EXIT: PostMessageW(g.hwnd, WM_CLOSE, 0, 0); break;
-        case IDM_EDIT_PAINT: EditInPaint(); break;
-        case IDM_DELETE: DeleteCurrent(); break;
-        case IDM_ROTATE_CW: RotateView(1); break;
-        case IDM_ROTATE_CCW: RotateView(-1); break;
-        case IDM_SAVE: SaveRotationNow(); break;
+        case IDM_EXIT:
+            if (g.gridMode) ToggleGrid(); // Esc backs out of the grid first
+            else PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
+            break;
+        case IDM_EDIT_PAINT: EditInPaint(g.gridMode ? g.gridSel : g.cur); break;
+        case IDM_DELETE: DeleteAt(g.gridMode ? g.gridSel : g.cur); break;
+        case IDM_ROTATE_CW:
+            if (!g.gridMode) RotateView(1);
+            break;
+        case IDM_ROTATE_CCW:
+            if (!g.gridMode) RotateView(-1);
+            break;
+        case IDM_SAVE:
+            if (!g.gridMode) SaveRotationNow();
+            break;
         case IDM_DETAILS:
             g.showDetails = !g.showDetails;
             InvalidateRect(g.hwnd, nullptr, FALSE);
@@ -1165,20 +1360,37 @@ void OnCommand(WORD id) {
             g.showFilmstrip = !g.showFilmstrip;
             InvalidateRect(g.hwnd, nullptr, FALSE);
             break;
-        case IDM_ZOOMIN: ZoomStep(1.25); break;
-        case IDM_ZOOMOUT: ZoomStep(1.0 / 1.25); break;
+        case IDM_GRID: ToggleGrid(); break;
+        case IDM_ZOOMIN:
+            if (g.gridMode) GridZoom(true);
+            else ZoomStep(1.25);
+            break;
+        case IDM_ZOOMOUT:
+            if (g.gridMode) GridZoom(false);
+            else ZoomStep(1.0 / 1.25);
+            break;
         case IDM_FIT:
-            g.fitMode = true;
-            InvalidateRect(g.hwnd, nullptr, FALSE);
+            if (!g.gridMode) {
+                g.fitMode = true;
+                InvalidateRect(g.hwnd, nullptr, FALSE);
+            }
             break;
         case IDM_NEXT:
-            if (!g.files.empty()) NavigateTo(g.cur + 1);
+            if (g.gridMode) GridMoveSel(1);
+            else if (!g.files.empty()) NavigateTo(g.cur + 1);
             break;
         case IDM_PREV:
-            if (!g.files.empty()) NavigateTo(g.cur - 1);
+            if (g.gridMode) GridMoveSel(-1);
+            else if (!g.files.empty()) NavigateTo(g.cur - 1);
             break;
-        case IDM_PAGE_NEXT: SetPage((int)g.page + 1); break;
-        case IDM_PAGE_PREV: SetPage((int)g.page - 1); break;
+        case IDM_PAGE_NEXT:
+            if (g.gridMode) GridMoveSel(g.gridCols);
+            else SetPage((int)g.page + 1);
+            break;
+        case IDM_PAGE_PREV:
+            if (g.gridMode) GridMoveSel(-g.gridCols);
+            else SetPage((int)g.page - 1);
+            break;
         default: break;
     }
 }
@@ -1189,26 +1401,35 @@ void OnInitMenuPopup(HMENU menu) {
     auto enable = [&](UINT id, bool on) {
         EnableMenuItem(menu, id, MF_BYCOMMAND | (on ? MF_ENABLED : MF_GRAYED));
     };
-    enable(IDM_EDIT_PAINT, haveImage);
-    enable(IDM_DELETE, haveImage);
-    enable(IDM_ROTATE_CW, haveDisp);
-    enable(IDM_ROTATE_CCW, haveDisp);
-    enable(IDM_SAVE, haveDisp && g.rot != 0 && !g.savePending);
-    enable(IDM_ZOOMIN, haveDisp);
-    enable(IDM_ZOOMOUT, haveDisp);
-    enable(IDM_FIT, haveDisp);
+    const bool haveAny = !g.files.empty();
+    enable(IDM_EDIT_PAINT, g.gridMode ? haveAny : haveImage);
+    enable(IDM_DELETE, g.gridMode ? haveAny : haveImage);
+    enable(IDM_ROTATE_CW, haveDisp && !g.gridMode);
+    enable(IDM_ROTATE_CCW, haveDisp && !g.gridMode);
+    enable(IDM_SAVE, haveDisp && !g.gridMode && g.rot != 0 && !g.savePending);
+    enable(IDM_ZOOMIN, g.gridMode || haveDisp);
+    enable(IDM_ZOOMOUT, g.gridMode || haveDisp);
+    enable(IDM_FIT, haveDisp && !g.gridMode);
     enable(IDM_NEXT, g.files.size() > 1);
     enable(IDM_PREV, g.files.size() > 1);
-    enable(IDM_PAGE_NEXT, haveDisp && g.disp->pageCount > 1);
-    enable(IDM_PAGE_PREV, haveDisp && g.disp->pageCount > 1);
+    enable(IDM_PAGE_NEXT, g.gridMode ? haveAny : (haveDisp && g.disp->pageCount > 1));
+    enable(IDM_PAGE_PREV, g.gridMode ? haveAny : (haveDisp && g.disp->pageCount > 1));
     CheckMenuItem(menu, IDM_DETAILS,
                   MF_BYCOMMAND | (g.showDetails ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_FILMSTRIP,
                   MF_BYCOMMAND | (g.showFilmstrip ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, IDM_GRID,
+                  MF_BYCOMMAND | (g.gridMode ? MF_CHECKED : MF_UNCHECKED));
 }
 
 void OnLButtonDown(POINT pt) {
     RECT rc = ClientRect();
+    if (g.gridMode) {
+        GridLayout gl = ComputeGrid(rc);
+        int idx = GridHitTest(pt, gl);
+        if (idx >= 0) OpenFromGrid(idx); // click switches to the image
+        return;
+    }
     Layout L = ComputeLayout(rc);
     UiRects ui = ComputeUiRects(L.imgArea);
 
@@ -1249,10 +1470,19 @@ void OnMouseMove(POINT pt) {
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 
-void OnMouseWheel(POINT screenPt, int delta) {
+void OnMouseWheel(POINT screenPt, int delta, bool ctrl) {
     POINT pt = screenPt;
     ScreenToClient(g.hwnd, &pt);
     RECT rc = ClientRect();
+    if (g.gridMode) {
+        if (ctrl) {
+            GridZoom(delta > 0);
+        } else {
+            g.gridScroll -= delta; // clamped in ComputeGrid
+            InvalidateRect(g.hwnd, nullptr, FALSE);
+        }
+        return;
+    }
     Layout L = ComputeLayout(rc);
     if (g.showFilmstrip && PtInRect(&L.stripRc, pt)) {
         g.strip.Scroll(delta);
@@ -1301,8 +1531,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case WM_MOUSEWHEEL:
             OnMouseWheel({GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)},
-                         GET_WHEEL_DELTA_WPARAM(wParam));
+                         GET_WHEEL_DELTA_WPARAM(wParam),
+                         (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) != 0);
             return 0;
+        case WM_KEYDOWN:
+            if (g.gridMode && wParam == VK_RETURN) {
+                OpenFromGrid(g.gridSel);
+                return 0;
+            }
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
         case WM_TIMER:
             if (wParam == kTimerHq) {
                 KillTimer(hwnd, kTimerHq);
