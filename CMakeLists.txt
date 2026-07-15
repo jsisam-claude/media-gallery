@@ -1,10 +1,35 @@
-﻿# Photo Gallery — minimal Windows photo viewer (WinAPI + GDI+/WIC, zero external deps)
+# Photo Gallery — minimal Windows photo viewer (WinAPI + GDI+/WIC) with
+# optional video playback (vendored player engine + FFmpeg, see
+# third_party/ and BUILDING.md).
 #
 # Visual Studio:  open this folder ("Open a local folder"), or:
-#   cmake -B build -G "Visual Studio 17 2022" -A x64
-#   cmake --build build --config Release
-cmake_minimum_required(VERSION 3.15)
-project(PhotoGallery LANGUAGES CXX)
+#   cmake --preset x64-release          (from an x64 Native Tools prompt)
+#   cmake --build --preset x64-release
+cmake_minimum_required(VERSION 3.24)
+project(PhotoGallery LANGUAGES C CXX)
+
+# Video playback compiles the vendored FFmpeg + player engine (MSVC only:
+# the committed FFmpeg config in third_party/ffmpeg-config is harvested
+# from an MSVC win64 configure). OFF builds the image-only viewer with
+# src/player_stub.cpp — same behavior as every non-CMake build route.
+option(PHOTOGALLERY_VIDEO "Build with video playback (MSVC only)" ON)
+if(NOT MSVC)
+    set(PHOTOGALLERY_VIDEO OFF)
+endif()
+
+if(MSVC)
+    # Static CRT, hoisted globally BEFORE any target: the ff_* libs created
+    # inside cmake/ffmpeg.cmake would otherwise default to /MD and the final
+    # link fails with LNK2038 (RuntimeLibrary mismatch).
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    # The default "Developer Command Prompt/PowerShell" targets x86; its LIB
+    # paths make every x64 link fail with LNK4272/LNK2001 on all symbols.
+    if(DEFINED ENV{LIB} AND "$ENV{LIB}" MATCHES "[\\\\/]x86(;|$)")
+        message(FATAL_ERROR "This shell's LIB points at x86 libraries. "
+            "Use the 'x64 Native Tools Command Prompt for VS' (or "
+            "VsDevCmd.bat -arch=x64 -host_arch=x64), then reconfigure.")
+    endif()
+endif()
 
 add_executable(PhotoGallery WIN32
     src/main.cpp
@@ -24,7 +49,6 @@ target_compile_definitions(PhotoGallery PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x
 if(MSVC)
     # Hardened, static-CRT release binary; /W4 warnings.
     target_compile_options(PhotoGallery PRIVATE /W4 /EHsc /guard:cf)
-    set_property(TARGET PhotoGallery PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     target_link_options(PhotoGallery PRIVATE /DYNAMICBASE /NXCOMPAT /guard:cf /MANIFEST:NO)
 else()
     # clang/mingw
@@ -35,3 +59,36 @@ endif()
 target_link_libraries(PhotoGallery PRIVATE
     gdiplus windowscodecs shlwapi shell32 ole32 oleaut32 uuid comdlg32 gdi32 user32
 )
+
+if(PHOTOGALLERY_VIDEO)
+    # Vendored FFmpeg, compiled by this toolchain from source text only —
+    # see cmake/ffmpeg.cmake (copied verbatim from the player repo).
+    include(cmake/ffmpeg.cmake)
+
+    # The embeddable engine; the app includes only player.h.
+    add_library(player_engine STATIC
+        third_party/player-engine/player.cpp
+        third_party/player-engine/demux.cpp
+        third_party/player-engine/decode.cpp
+        third_party/player-engine/queue.cpp
+        third_party/player-engine/audio_out.cpp
+        third_party/player-engine/video_out.cpp
+        third_party/player-engine/subs.cpp
+    )
+    set_target_properties(player_engine PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+    )
+    target_compile_definitions(player_engine PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(player_engine PRIVATE /W3 /utf-8)
+    target_include_directories(player_engine PUBLIC third_party/player-engine)
+    target_link_libraries(player_engine
+        PRIVATE ffmpeg
+        PUBLIC d3d11 dxgi d3dcompiler d2d1 dwrite ole32 avrt winmm user32
+    )
+
+    target_link_libraries(PhotoGallery PRIVATE player_engine)
+else()
+    target_sources(PhotoGallery PRIVATE src/player_stub.cpp)
+    target_include_directories(PhotoGallery PRIVATE third_party/player-engine)
+endif()

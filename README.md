@@ -1,10 +1,16 @@
 # Photo Gallery
 
 A minimal, secure Windows photo viewer in the spirit of the stock Windows Photo
-Viewer — single small native executable, **zero third-party dependencies**.
-Pure C++ / WinAPI with GDI+ and WIC (both part of Windows) doing all image
-decoding, so every parser is OS-maintained and security-patched by Windows
-Update. Runs on stock Windows 10 and 11.
+Viewer — single small native executable, **no packages, no DLLs, no
+downloads**. Pure C++ / WinAPI with GDI+ and WIC (both part of Windows) doing
+all *image* decoding, so every image parser is OS-maintained and
+security-patched by Windows Update. Optional *video* playback is the one
+exception to "zero third-party code": an embedded player engine plus an
+FFmpeg subset (LGPL-2.1+), vendored into `third_party/` as plain committed
+source and compiled by your own toolchain — nothing is fetched or prebuilt,
+but those parsers are updated by re-vendoring, not by Windows Update. Builds
+without the engine (`src/player_stub.cpp`) remain image-only. Runs on stock
+Windows 10 and 11.
 
 ## Features
 
@@ -61,8 +67,9 @@ Update. Runs on stock Windows 10 and 11.
 
 Full step-by-step instructions (all toolchains, output paths,
 troubleshooting): **[BUILDING.md](BUILDING.md)**. Short version — no
-third-party SDKs, no vcpkg/NuGet, everything links against Windows system
-libraries, and any one of these works:
+third-party SDKs, no vcpkg/NuGet, no downloads. **Video playback is built
+only by the CMake + MSVC route** (it compiles the vendored FFmpeg subset);
+every other route produces the image-only viewer:
 
 **Visual Studio (recommended)** — VS 2022 with the *Desktop development with
 C++* workload (MFC not required). Open **`PhotoGallery.sln`** and build
@@ -83,13 +90,16 @@ CMake also works if you prefer it (*File → Open → Folder*, or):
 
     make            # cross from Linux, or: mingw32-make CXX=g++ WINDRES=windres on MSYS2
 
-The output is a single self-contained `PhotoGallery.exe` (~370 KB, static CRT)
-that runs on stock Windows 10/11.
+The output is a single self-contained `PhotoGallery.exe` (static CRT) that
+runs on stock Windows 10/11 — ~370 KB image-only, a few MB with the video
+engine linked in.
 
 ## Security notes
 
-- All decoding is done by OS codecs (GDI+/WIC) that receive Windows Update
-  patches; no third-party or hand-written parsers.
+- All image decoding is done by OS codecs (GDI+/WIC) that receive Windows
+  Update patches; no third-party or hand-written image parsers. Video
+  decoding (when built in) uses the vendored FFmpeg — in-process parsers
+  whose patch story is re-vendoring, not Windows Update.
 - A decompression-bomb guard caps decoded size (~134 MP) regardless of codec.
 - Wide-character APIs throughout; paths are canonicalized and checked against
   the decoder-derived extension allowlist before any use.

@@ -50,6 +50,8 @@
       <ConformanceMode>true</ConformanceMode>
       <ControlFlowGuard>Guard</ControlFlowGuard>
       <PreprocessorDefinitions>UNICODE;_UNICODE;_WIN32_WINNT=0x0A00;WINVER=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- player.h only; player_stub.cpp keeps this an image-only build (video = CMake route). -->
+      <AdditionalIncludeDirectories>third_party\player-engine;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -80,6 +82,7 @@
     <ClCompile Include="src\decoder_gdiplus.cpp" />
     <ClCompile Include="src\decoder_wic.cpp" />
     <ClCompile Include="src\filmstrip.cpp" />
+    <ClCompile Include="src\player_stub.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\decoder.h" />
