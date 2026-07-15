@@ -114,6 +114,14 @@ static bool create_device_swapchain(D3DState* d) {
     }
     if (FAILED(hr)) return fail_step(L"D3D11CreateDevice (hardware and WARP)", hr);
 
+    // The avcodec D3D11VA decoder worker threads share this device with the
+    // render thread; without this the driver may crash under contention.
+    ID3D10Multithread* mt = nullptr;
+    if (SUCCEEDED(d->dev->QueryInterface(__uuidof(ID3D10Multithread), (void**)&mt))) {
+        mt->SetMultithreadProtected(TRUE);
+        mt->Release();
+    }
+
     IDXGIDevice* dxgi_dev = nullptr;
     IDXGIAdapter* adapter = nullptr;
     IDXGIFactory2* factory = nullptr;
@@ -155,6 +163,8 @@ static bool create_device_swapchain(D3DState* d) {
     return true;
 }
 
+// (Re)creates the video processor for a given input size. The NV12 staging
+// texture used by the sw-frame path is created separately on demand.
 static bool ensure_video_processor(D3DState* d, int w, int h) {
     if (d->vp && w == d->in_w && h == d->in_h) return true;
     safe_release(d->in_view);
@@ -172,9 +182,16 @@ static bool ensure_video_processor(D3DState* d, int w, int h) {
     if (FAILED(d->vdev->CreateVideoProcessorEnumerator(&cd, &d->vpe))) return false;
     if (FAILED(d->vdev->CreateVideoProcessor(d->vpe, 0, &d->vp))) return false;
 
+    d->in_w = w;
+    d->in_h = h;
+    return true;
+}
+
+static bool ensure_staging_input(D3DState* d) {
+    if (d->in_tex) return true;
     D3D11_TEXTURE2D_DESC td = {};
-    td.Width = w;
-    td.Height = h;
+    td.Width = d->in_w;
+    td.Height = d->in_h;
     td.MipLevels = 1;
     td.ArraySize = 1;
     td.Format = DXGI_FORMAT_NV12;
@@ -186,11 +203,10 @@ static bool ensure_video_processor(D3DState* d, int w, int h) {
     ivd.FourCC = 0;
     ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
     ivd.Texture2D.MipSlice = 0;
-    if (FAILED(d->vdev->CreateVideoProcessorInputView(d->in_tex, d->vpe, &ivd, &d->in_view)))
+    if (FAILED(d->vdev->CreateVideoProcessorInputView(d->in_tex, d->vpe, &ivd, &d->in_view))) {
+        safe_release(d->in_tex);
         return false;
-
-    d->in_w = w;
-    d->in_h = h;
+    }
     return true;
 }
 
@@ -219,8 +235,11 @@ static RECT letterbox(int vw, int vh, int ww, int wh) {
     return r;
 }
 
-static void draw_subtitle(D3DState* d, ID3D11Texture2D* backbuffer, const std::wstring& text) {
-    if (!d->d2df || !d->dwf || text.empty()) return;
+static void draw_overlays(D3DState* d, ID3D11Texture2D* backbuffer,
+                          const SubRender& ov, const RECT& dst_rc) {
+    if (!d->d2df || !d->dwf) return;
+    if (ov.text.empty() && ov.osd.empty() && ov.bitmaps.empty()) return;
+    const std::wstring& text = ov.text;
 
     if (!d->d2drt) {
         IDXGISurface* surf = nullptr;
@@ -232,6 +251,33 @@ static void draw_subtitle(D3DState* d, ID3D11Texture2D* backbuffer, const std::w
         surf->Release();
         if (FAILED(hr)) { d->d2drt = nullptr; return; }
     }
+
+    // bitmap subtitles: map from their source coordinate space onto the
+    // letterboxed video rect
+    if (!ov.bitmaps.empty()) {
+        d->d2drt->BeginDraw();
+        for (auto& b : ov.bitmaps) {
+            if (!b || b->src_w <= 0 || b->src_h <= 0) continue;
+            ID2D1Bitmap* bmp = nullptr;
+            D2D1_BITMAP_PROPERTIES bp = D2D1::BitmapProperties(
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                                  D2D1_ALPHA_MODE_PREMULTIPLIED));
+            if (FAILED(d->d2drt->CreateBitmap(D2D1::SizeU(b->w, b->h),
+                                              b->pixels.data(), b->w * 4, bp, &bmp)))
+                continue;
+            float sx = (float)(dst_rc.right - dst_rc.left) / b->src_w;
+            float sy = (float)(dst_rc.bottom - dst_rc.top) / b->src_h;
+            D2D1_RECT_F dest = D2D1::RectF(
+                dst_rc.left + b->x * sx, dst_rc.top + b->y * sy,
+                dst_rc.left + (b->x + b->w) * sx, dst_rc.top + (b->y + b->h) * sy);
+            d->d2drt->DrawBitmap(bmp, dest, 1.0f,
+                                 D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            bmp->Release();
+        }
+        d->d2drt->EndDraw();
+    }
+
+    if (text.empty() && ov.osd.empty()) return;
 
     int px = d->out_h / 18;
     if (px < 14) px = 14;
@@ -257,12 +303,33 @@ static void draw_subtitle(D3DState* d, ID3D11Texture2D* backbuffer, const std::w
     d->d2drt->BeginDraw();
     const float o = px / 14.0f;  // shadow/outline offset
     const D2D1_POINT_2F offs[] = {{-o, 0}, {o, 0}, {0, -o}, {0, o}, {o, o}};
-    for (auto& off : offs) {
-        D2D1_RECT_F b = box;
-        b.left += off.x; b.right += off.x; b.top += off.y; b.bottom += off.y;
-        d->d2drt->DrawTextW(text.c_str(), (UINT32)text.size(), d->text_fmt, b, black);
+    if (!text.empty()) {
+        for (auto& off : offs) {
+            D2D1_RECT_F b = box;
+            b.left += off.x; b.right += off.x; b.top += off.y; b.bottom += off.y;
+            d->d2drt->DrawTextW(text.c_str(), (UINT32)text.size(), d->text_fmt, b, black);
+        }
+        d->d2drt->DrawTextW(text.c_str(), (UINT32)text.size(), d->text_fmt, box, white);
     }
-    d->d2drt->DrawTextW(text.c_str(), (UINT32)text.size(), d->text_fmt, box, white);
+    if (!ov.osd.empty()) {
+        IDWriteTextFormat* of = nullptr;
+        int opx = d->out_h / 24;
+        if (opx < 12) opx = 12;
+        d->dwf->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                 DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                                 (float)opx, L"", &of);
+        if (of) {
+            D2D1_RECT_F obox = D2D1::RectF(14.0f, 12.0f, d->out_w - 14.0f,
+                                           12.0f + opx * 1.6f);
+            for (auto& off : offs) {
+                D2D1_RECT_F b = obox;
+                b.left += off.x; b.right += off.x; b.top += off.y; b.bottom += off.y;
+                d->d2drt->DrawTextW(ov.osd.c_str(), (UINT32)ov.osd.size(), of, b, black);
+            }
+            d->d2drt->DrawTextW(ov.osd.c_str(), (UINT32)ov.osd.size(), of, obox, white);
+            of->Release();
+        }
+    }
     d->d2drt->EndDraw();
     black->Release();
     white->Release();
@@ -278,6 +345,11 @@ bool VideoOut::init(HWND hwnd) {
         return false;
     }
     return true;
+}
+
+ID3D11Device* VideoOut::decode_device() {
+    std::lock_guard<std::mutex> lk(m_);
+    return (d && d->use_vp) ? d->dev : nullptr;
 }
 
 void VideoOut::resize() {
@@ -296,8 +368,62 @@ void VideoOut::resize() {
     d->in_w = d->in_h = 0;
 }
 
+static bool vp_blt(D3DState* d, ID3D11VideoProcessorInputView* in_view,
+                   AVFrame* f, ID3D11Texture2D* back, const RECT& dst_rc) {
+    set_colorspace(d, f);
+
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd = {};
+    ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    ID3D11VideoProcessorOutputView* out_view = nullptr;
+    HRESULT hr = d->vdev->CreateVideoProcessorOutputView(back, d->vpe, &ovd, &out_view);
+    if (SUCCEEDED(hr)) {
+        RECT src = {0, 0, f->width, f->height};
+        RECT out_rc = {0, 0, d->out_w, d->out_h};
+        RECT dst_copy = dst_rc;
+        d->vctx->VideoProcessorSetStreamSourceRect(d->vp, 0, TRUE, &src);
+        d->vctx->VideoProcessorSetStreamDestRect(d->vp, 0, TRUE, &dst_copy);
+        d->vctx->VideoProcessorSetOutputTargetRect(d->vp, TRUE, &out_rc);
+        D3D11_VIDEO_COLOR black = {};
+        black.YCbCr.Y = 0.0625f;
+        black.YCbCr.Cb = 0.5f;
+        black.YCbCr.Cr = 0.5f;
+        black.YCbCr.A = 1.0f;
+        d->vctx->VideoProcessorSetOutputBackgroundColor(d->vp, TRUE, &black);
+
+        D3D11_VIDEO_PROCESSOR_STREAM stream = {};
+        stream.Enable = TRUE;
+        stream.pInputSurface = in_view;
+        hr = d->vctx->VideoProcessorBlt(d->vp, out_view, 0, 1, &stream);
+        out_view->Release();
+    }
+    if (FAILED(hr)) log_line("video: VideoProcessorBlt failed 0x%08lx", hr);
+    return SUCCEEDED(hr);
+}
+
 static bool render_vp(D3DState* d, AVFrame* f, ID3D11Texture2D* back,
                       const RECT& dst_rc) {
+    // D3D11VA decoder output: a slice of the decoder's texture array on our
+    // own device. Feed it to the video processor directly - no CPU copy.
+    if (f->format == AV_PIX_FMT_D3D11) {
+        ID3D11Texture2D* tex = (ID3D11Texture2D*)f->data[0];
+        UINT slice = (UINT)(uintptr_t)f->data[1];
+        if (!tex) return false;
+        D3D11_TEXTURE2D_DESC td;
+        tex->GetDesc(&td);
+        if (!ensure_video_processor(d, (int)td.Width, (int)td.Height)) return false;
+
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd = {};
+        ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        ivd.Texture2D.MipSlice = 0;
+        ivd.Texture2D.ArraySlice = slice;
+        ID3D11VideoProcessorInputView* view = nullptr;
+        if (FAILED(d->vdev->CreateVideoProcessorInputView(tex, d->vpe, &ivd, &view)))
+            return false;
+        bool ok = vp_blt(d, view, f, back, dst_rc);
+        view->Release();
+        return ok;
+    }
+
     int w = f->width, h = f->height;
     // Convert to NV12 (contiguous Y then interleaved UV, single pitch).
     int pitch = (w + 127) & ~127;
@@ -318,35 +444,9 @@ static bool render_vp(D3DState* d, AVFrame* f, ID3D11Texture2D* back,
     sws_scale(d->sws, f->data, f->linesize, 0, h, dst, dst_stride);
 
     if (!ensure_video_processor(d, w, h)) return false;
+    if (!ensure_staging_input(d)) return false;
     d->ctx->UpdateSubresource(d->in_tex, 0, nullptr, d->nv12, pitch, 0);
-    set_colorspace(d, f);
-
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd = {};
-    ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-    ID3D11VideoProcessorOutputView* out_view = nullptr;
-    HRESULT hr = d->vdev->CreateVideoProcessorOutputView(back, d->vpe, &ovd, &out_view);
-    if (SUCCEEDED(hr)) {
-        RECT src = {0, 0, w, h};
-        RECT out_rc = {0, 0, d->out_w, d->out_h};
-        RECT dst_copy = dst_rc;
-        d->vctx->VideoProcessorSetStreamSourceRect(d->vp, 0, TRUE, &src);
-        d->vctx->VideoProcessorSetStreamDestRect(d->vp, 0, TRUE, &dst_copy);
-        d->vctx->VideoProcessorSetOutputTargetRect(d->vp, TRUE, &out_rc);
-        D3D11_VIDEO_COLOR black = {};
-        black.YCbCr.Y = 0.0625f;
-        black.YCbCr.Cb = 0.5f;
-        black.YCbCr.Cr = 0.5f;
-        black.YCbCr.A = 1.0f;
-        d->vctx->VideoProcessorSetOutputBackgroundColor(d->vp, TRUE, &black);
-
-        D3D11_VIDEO_PROCESSOR_STREAM stream = {};
-        stream.Enable = TRUE;
-        stream.pInputSurface = d->in_view;
-        hr = d->vctx->VideoProcessorBlt(d->vp, out_view, 0, 1, &stream);
-        out_view->Release();
-    }
-    if (FAILED(hr)) log_line("video: VideoProcessorBlt failed 0x%08lx", hr);
-    return SUCCEEDED(hr);
+    return vp_blt(d, d->in_view, f, back, dst_rc);
 }
 
 static bool render_shader(D3DState* d, AVFrame* f, ID3D11Texture2D* back,
@@ -419,7 +519,7 @@ static bool render_shader(D3DState* d, AVFrame* f, ID3D11Texture2D* back,
     return true;
 }
 
-bool VideoOut::render(AVFrame* f, const std::wstring& subtitle) {
+bool VideoOut::render(AVFrame* f, const SubRender& overlays) {
     std::lock_guard<std::mutex> lk(m_);
     if (!d || !d->swap || !f) return false;
 
@@ -435,9 +535,13 @@ bool VideoOut::render(AVFrame* f, const std::wstring& subtitle) {
     if (FAILED(d->swap->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&back)))
         return false;
 
+    if (f->format == AV_PIX_FMT_D3D11 && !d->use_vp) {
+        back->Release();  // hw frames only exist when decode_device() was handed out
+        return false;
+    }
     bool ok = d->use_vp ? render_vp(d, f, back, dst_rc)
                         : render_shader(d, f, back, dst_rc);
-    if (ok) draw_subtitle(d, back, subtitle);
+    if (ok) draw_overlays(d, back, overlays, dst_rc);
     back->Release();
     if (!ok) return false;
     d->swap->Present(1, 0);

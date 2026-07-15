@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -95,15 +96,34 @@ struct SubEntry {
     std::wstring text;
 };
 
+// One decoded bitmap subtitle rect (PGS/VobSub), BGRA premultiplied.
+struct SubBitmap {
+    double start = 0, end = 0;
+    int x = 0, y = 0, w = 0, h = 0;   // in (src_w, src_h) coordinate space
+    int src_w = 0, src_h = 0;
+    std::vector<uint32_t> pixels;      // w*h premultiplied BGRA
+};
+
+// What the renderer composites over a frame.
+struct SubRender {
+    std::wstring text;
+    std::wstring osd;
+    std::vector<std::shared_ptr<SubBitmap>> bitmaps;
+};
+
 class SubtitleList {
 public:
     void add(double start, double end, std::wstring text);
+    void add_bitmap(std::shared_ptr<SubBitmap> b);
+    void clear_bitmaps_at(double pts);  // PGS empty event ends open bitmaps
     std::wstring active_at(double pts);
+    void active_bitmaps_at(double pts, std::vector<std::shared_ptr<SubBitmap>>& out);
     void clear();
 
 private:
     std::mutex m_;
     std::vector<SubEntry> entries_;
+    std::vector<std::shared_ptr<SubBitmap>> bitmaps_;
 };
 
 // Decode one subtitle packet with ctx and append results (handles srt/ass/mov_text).
@@ -150,6 +170,7 @@ private:
 // ---------------------------------------------------------------- video out
 
 struct D3DState;  // D3D11/D2D bits hidden in video_out.cpp
+struct ID3D11Device;
 
 // Which init step failed and its HRESULT (empty if none).
 const wchar_t* vo_init_error();
@@ -157,10 +178,15 @@ const wchar_t* vo_init_error();
 class VideoOut {
 public:
     bool init(HWND hwnd);
-    // Renders a CPU frame (any sw pix fmt) + optional subtitle text overlay.
-    bool render(AVFrame* f, const std::wstring& subtitle);
+    // Renders a CPU frame (any sw pix fmt) or an AV_PIX_FMT_D3D11 decoder
+    // texture, plus subtitle/OSD overlays.
+    bool render(AVFrame* f, const SubRender& overlays);
     void resize();
     void shutdown();
+    // Device for D3D11VA decoding (shared with rendering so decoder output
+    // feeds the video processor with zero copies). Null when the device has
+    // no video API (shader fallback) - callers then decode in software.
+    ID3D11Device* decode_device();
     ~VideoOut() { shutdown(); }
 
 private:
@@ -180,6 +206,9 @@ struct Player {
     int vst = -1, ast = -1, sst = -1; // active stream indices (-1 = none)
     std::vector<int> audio_streams;
     std::vector<int> sub_streams;     // internal subtitle stream indices
+    std::mutex tracks_m;              // guards the two name vectors
+    std::vector<std::wstring> audio_names;
+    std::vector<std::wstring> sub_names;  // [external?, internals...]
     bool has_external_subs = false;
     int sub_choice = 0;               // index into effective sub track list; 0 = default
     AVCodecContext* vctx = nullptr;
@@ -216,6 +245,16 @@ struct Player {
     std::mutex lastf_m;
     AVFrame* last_frame = nullptr;
     std::atomic<bool> redraw_req{false};
+
+    // transient OSD text (guarded by osd_m)
+    std::mutex osd_m;
+    std::wstring osd_text;
+    int64_t osd_until = 0;            // av_gettime_relative() deadline
+    std::wstring osd_now() {
+        std::lock_guard<std::mutex> lk(osd_m);
+        if (osd_text.empty() || av_gettime_relative() > osd_until) return L"";
+        return osd_text;
+    }
 
     void fire(PlayerEvent evt) {
         if (evt_fn) evt_fn(evt_user, evt);
