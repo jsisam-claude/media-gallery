@@ -1,0 +1,5 @@
+Origin: vlc-light-win64 (minimal-player engine)
+Commit: 63ead89b0d9e88b469438b15e9ec60bb03ed6bb4
+Files: 9 engine sources (+ LICENSE), plus 938 files mirrored verbatim into third_party/ffmpeg-src and third_party/ffmpeg-config (see their own PROVENANCE.txt) and cmake/ffmpeg.cmake + cmake/ffmpeg_sources.txt.
+Vendored by tools/vendor_player.cmake; unmodified upstream text.
+License: LGPL-2.1-or-later (LICENSE in this directory).
