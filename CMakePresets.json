@@ -1,0 +1,32 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "x64-release",
+      "displayName": "x64 Release (static, video-enabled, pure VS toolchain)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "architecture": { "value": "x64", "strategy": "external" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "x64-debug",
+      "displayName": "x64 Debug (static, video-enabled, pure VS toolchain)",
+      "inherits": "x64-release",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "x64-release-novideo",
+      "displayName": "x64 Release, image-only (stubbed player, fast build)",
+      "inherits": "x64-release",
+      "cacheVariables": { "PHOTOGALLERY_VIDEO": "OFF" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "x64-release", "configurePreset": "x64-release" },
+    { "name": "x64-debug", "configurePreset": "x64-debug" },
+    { "name": "x64-release-novideo", "configurePreset": "x64-release-novideo" }
+  ]
+}

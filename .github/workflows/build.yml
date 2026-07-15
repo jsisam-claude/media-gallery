@@ -1,0 +1,28 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  win64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        run: cmake --preset x64-release
+
+      - name: Build
+        run: cmake --build --preset x64-release
+
+      - name: Upload gallery exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: photo-gallery-win64
+          path: build/x64-release/PhotoGallery.exe
