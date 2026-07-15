@@ -17,6 +17,13 @@ Windows 10 and 11.
 - **Formats:** JPEG, GIF, PNG, BMP, TIFF, ICO (GDI+) plus JPEG XR and DDS (WIC).
   HEIC/HEIF, AVIF, WebP and camera RAW light up automatically when the free
   Microsoft Store codec extensions are installed — no code changes needed.
+- **Video (CMake/MSVC builds):** MP4, M4V, MOV, MKV, WebM and AVI play in
+  place with audio via the embedded player engine (D3D11 + WASAPI, vendored
+  FFmpeg demux/decode). Videos appear in the folder list, filmstrip and grid
+  like any image; a transport bar (play/pause, seek) sits above the
+  filmstrip, `Space` pauses, `Ctrl+←`/`Ctrl+→` seek ±10 s, the wheel adjusts
+  volume, and `I` shows duration/codec details. *View → Auto-Advance After
+  Video* (off by default) moves to the next item when playback ends.
 - **Explorer-order navigation:** if the folder is open in an Explorer window,
   `←`/`→` follow *that window's current sort order* (read live via
   `IShellWindows`/`IFolderView`); otherwise Explorer's default natural name
@@ -50,7 +57,9 @@ Windows 10 and 11.
 | --- | --- |
 | `→` / `←` | Next / previous image (wraps around) |
 | `↑` / `↓`, `PgUp` / `PgDn` | Previous / next page (multi-page files) |
-| Mouse wheel | Zoom at cursor (over the filmstrip: scroll it) |
+| `Space` | Play/pause the current video |
+| `Ctrl+→` / `Ctrl+←` | Seek ±10 s in the current video |
+| Mouse wheel | Zoom at cursor (over the filmstrip: scroll it; over a video: volume) |
 | `Ctrl` `+` / `Ctrl` `-` / `Ctrl+0` | Zoom in / out / fit |
 | Left-drag | Pan when zoomed in |
 | `Ctrl+R` / `Ctrl+Shift+R` | Rotate right / left |

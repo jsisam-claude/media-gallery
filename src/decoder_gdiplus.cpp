@@ -332,7 +332,19 @@ ImageDecoder* FindDecoder(const std::wstring& path) {
 
 bool IsSupportedImage(const std::wstring& path) { return FindDecoder(path) != nullptr; }
 
-std::wstring OpenDialogFilter() {
+// Video containers handled by the optional player engine (player.h). Whether
+// the engine is actually available is the app's call, not this predicate's.
+static const wchar_t* const kVideoExts[] = {L"mp4", L"m4v", L"mov",
+                                            L"mkv", L"webm", L"avi"};
+
+bool IsVideoFile(const std::wstring& path) {
+    const std::wstring ext = FileExtLower(path);
+    for (const wchar_t* e : kVideoExts)
+        if (ext == e) return true;
+    return false;
+}
+
+std::wstring OpenDialogFilter(bool includeVideo) {
     std::wstring patterns;
     for (ImageDecoder* d : g_decoders) {
         for (const auto& e : d->Extensions()) {
@@ -343,7 +355,16 @@ std::wstring OpenDialogFilter() {
             }
         }
     }
-    std::wstring filter = L"Images";
+    if (includeVideo) {
+        for (const wchar_t* e : kVideoExts) {
+            std::wstring pat = std::wstring(L"*.") + e;
+            if (patterns.find(pat) == std::wstring::npos) {
+                if (!patterns.empty()) patterns += L";";
+                patterns += pat;
+            }
+        }
+    }
+    std::wstring filter = includeVideo ? L"Images & videos" : L"Images";
     filter += L'\0';
     filter += patterns;
     filter += L'\0';

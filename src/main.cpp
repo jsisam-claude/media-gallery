@@ -19,12 +19,15 @@
 
 #include "decoder.h"
 #include "filmstrip.h"
+#include "player.h"
 #include "resource.h"
 
 #define WM_APP_DECODED (WM_APP + 1)
 #define WM_APP_THUMB   (WM_APP + 2)
 #define WM_APP_LIST    (WM_APP + 3)
 #define WM_APP_SAVED   (WM_APP + 4)
+#define WM_APP_PLAYER  (WM_APP + 5) // wParam = PlayerEvent, lParam = open generation
+#define WM_APP_PROBED  (WM_APP + 6)
 
 namespace {
 
@@ -36,6 +39,8 @@ constexpr COLORREF kTextDim = RGB(160, 160, 160);
 constexpr COLORREF kAccent = RGB(0, 120, 215);
 constexpr double kMinZoom = 0.05, kMaxZoom = 16.0;
 constexpr UINT_PTR kTimerHq = 1;
+constexpr UINT_PTR kTimerVideo = 2; // transport-bar refresh while a video plays
+constexpr int kVideoBarH = 34;      // transport bar height, pre-DPI-scale
 
 // ---------------------------------------------------------------- decode worker
 
@@ -47,6 +52,11 @@ struct DecodeDone {
 struct SaveDone {
     std::wstring path;
     bool ok;
+};
+struct ProbeDone {
+    std::wstring path;
+    bool ok;
+    PlayerMediaInfo info; // video metadata for the details pane
 };
 
 class DecodeWorker {
@@ -68,13 +78,20 @@ public:
         thread_ = nullptr;
         DeleteCriticalSection(&cs_);
     }
-    // Most-recent-wins: drops queued decodes (keeps queued saves).
+    // Most-recent-wins: drops queued decodes and probes (keeps queued saves).
     void RequestCurrent(const std::wstring& path, UINT page) {
         EnterCriticalSection(&cs_);
         q_.erase(std::remove_if(q_.begin(), q_.end(),
-                                [](const Job& j) { return j.kind == Job::Decode; }),
+                                [](const Job& j) { return j.kind != Job::Save; }),
                  q_.end());
         q_.push_front({Job::Decode, path, page, 0});
+        LeaveCriticalSection(&cs_);
+        WakeConditionVariable(&cv_);
+    }
+    // Video metadata for the details pane (player_probe hits the disk).
+    void RequestProbe(const std::wstring& path) {
+        EnterCriticalSection(&cs_);
+        q_.push_front({Job::Probe, path, 0, 0});
         LeaveCriticalSection(&cs_);
         WakeConditionVariable(&cv_);
     }
@@ -93,7 +110,7 @@ public:
 
 private:
     struct Job {
-        enum Kind { Decode, Save } kind;
+        enum Kind { Decode, Save, Probe } kind;
         std::wstring path;
         UINT page;
         int quarter;
@@ -115,6 +132,13 @@ private:
             q_.pop_front();
             LeaveCriticalSection(&cs_);
 
+            if (job.kind == Job::Probe) {
+                auto* d = new ProbeDone{std::move(job.path), false, PlayerMediaInfo{}};
+                d->ok = player_probe(d->path.c_str(), &d->info);
+                if (!PostMessageW(owner_, WM_APP_PROBED, 0, reinterpret_cast<LPARAM>(d)))
+                    delete d;
+                continue;
+            }
             ImageDecoder* dec = FindDecoder(job.path);
             if (job.kind == Job::Decode) {
                 DecodedImage* img = nullptr;
@@ -163,6 +187,8 @@ std::wstring ParentDir(const std::wstring& path) {
     return buf;
 }
 
+bool IsPlayableVideo(const std::wstring& path); // fwd decl (needs app state, defined below)
+
 // Items of an open Explorer window showing `dir`, in its current display order.
 std::vector<std::wstring> ExplorerViewOrder(const std::wstring& dir) {
     std::vector<std::wstring> out;
@@ -208,7 +234,7 @@ std::vector<std::wstring> ExplorerViewOrder(const std::wstring& dir) {
                         PIDLIST_ABSOLUTE full = ILCombine(folderPidl, child);
                         wchar_t buf[MAX_PATH];
                         if (full && SHGetPathFromIDListW(full, buf) &&
-                            IsSupportedImage(buf))
+                            (IsSupportedImage(buf) || IsPlayableVideo(buf)))
                             out.push_back(buf);
                         if (full) ILFree(full);
                         CoTaskMemFree(child);
@@ -240,7 +266,7 @@ std::vector<std::wstring> EnumerateDirNaturalOrder(const std::wstring& dir) {
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         std::wstring full = base + fd.cFileName;
-        if (IsSupportedImage(full)) out.push_back(std::move(full));
+        if (IsSupportedImage(full) || IsPlayableVideo(full)) out.push_back(std::move(full));
     } while (FindNextFileW(h, &fd));
     FindClose(h);
     std::sort(out.begin(), out.end(), [](const std::wstring& a, const std::wstring& b) {
@@ -293,8 +319,10 @@ struct Layout {
 
 struct UiRects {
     bool barVisible = false, saveVisible = false, pageVisible = false;
+    bool videoVisible = false;
     RECT rotCcw{}, rotCw{}, save{}, bar{};
     RECT pagePrev{}, pageNext{}, pageBar{};
+    RECT videoBar{}, playBtn{}, seekBar{}; // video transport, above the filmstrip
 };
 
 struct App {
@@ -335,11 +363,37 @@ struct App {
     int gridScroll = 0;    // vertical scroll, pixels
     int gridSel = 0;       // keyboard selection in the grid
 
+    // Video playback. player == nullptr (stub build, or D3D11 init failed)
+    // means video files are simply not supported.
+    HWND videoWnd = nullptr;       // child HWND the engine renders into
+    Player* player = nullptr;
+    unsigned playerGen = 0;        // open generation; drops stale engine events
+    bool videoMode = false;        // current item plays in the engine
+    bool videoEnded = false;       // playback reached end of media
+    bool videoAdvance = false;     // auto-advance to the next item on end
+    bool videoProbed = false;      // videoInfo holds data for the current item
+    PlayerMediaInfo videoInfo{};   // filled by the worker thread via WM_APP_PROBED
+
     std::vector<CacheEntry> cache; // tiny LRU of decoded images
     DecodeWorker worker;
     Filmstrip strip;
 };
 App g;
+
+// A video we can actually play: the engine exists (real build, D3D11 up)
+// and the extension is a known container. Folder scans, drops and the open
+// dialog all gate on this, so builds without the engine (player_stub.cpp)
+// behave exactly like the pre-video viewer.
+bool IsPlayableVideo(const std::wstring& path) {
+    return g.player != nullptr && IsVideoFile(path);
+}
+
+// Engine events fire on engine threads — bounce to the UI thread. The user
+// pointer carries the open generation so stale events are dropped.
+void OnPlayerEvent(void* user, PlayerEvent evt) {
+    PostMessageW(g.hwnd, WM_APP_PLAYER, static_cast<WPARAM>(evt),
+                 reinterpret_cast<LPARAM>(user));
+}
 
 std::wstring CacheKey(const std::wstring& path, UINT page) {
     return path + L"|" + std::to_wstring(page);
@@ -501,6 +555,7 @@ int Scaled(int v) { return MulDiv(v, g.dpi, 96); }
 
 RECT ClientRect(); // fwd decls (defined below)
 void DrawCenteredText(HDC dc, const RECT& rc, const wchar_t* text);
+void PositionVideoWindow();
 
 struct GridLayout {
     int cols = 1, cell = 1, rows = 0, contentH = 0;
@@ -550,6 +605,7 @@ void ToggleGrid() {
         g.gridSel = (std::max)(0, g.cur);
         GridEnsureVisible();
     }
+    PositionVideoWindow(); // grid paints the whole client; hide the video child
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 
@@ -681,6 +737,21 @@ UiRects ComputeUiRects(const RECT& imgArea) {
         r.pagePrev = {r.pageBar.left, r.pageBar.top, r.pageBar.left + Scaled(36), r.pageBar.bottom};
         r.pageNext = {r.pageBar.right - Scaled(36), r.pageBar.top, r.pageBar.right, r.pageBar.bottom};
     }
+
+    if (g.videoMode) {
+        // Transport strip along the bottom of imgArea; the video child is
+        // sized to stop above it (PositionVideoWindow), so the parent can
+        // draw and hit-test here.
+        r.videoVisible = true;
+        const int m = Scaled(8);
+        r.videoBar = {imgArea.left, imgArea.bottom - Scaled(kVideoBarH),
+                      imgArea.right, imgArea.bottom};
+        r.playBtn = {r.videoBar.left + m, r.videoBar.top + Scaled(4),
+                     r.videoBar.left + m + Scaled(56), r.videoBar.bottom - Scaled(4)};
+        const int mid = (r.videoBar.top + r.videoBar.bottom) / 2;
+        r.seekBar = {r.playBtn.right + m + Scaled(96), mid - Scaled(3),
+                     r.videoBar.right - m, mid + Scaled(3)};
+    }
     return r;
 }
 
@@ -760,6 +831,26 @@ std::vector<std::pair<std::wstring, std::wstring>> BuildDetails() {
             rows.emplace_back(L"Page", buf);
         }
         for (const auto& m : g.disp->meta) rows.push_back(m);
+    } else if (g.videoMode && g.videoProbed) {
+        // Filled asynchronously by the worker's player_probe (WM_APP_PROBED);
+        // never query the engine here — Paint calls this every frame.
+        wchar_t buf[64];
+        if (g.videoInfo.width > 0) {
+            swprintf(buf, 64, L"%d x %d", g.videoInfo.width, g.videoInfo.height);
+            rows.emplace_back(L"Dimensions", buf);
+        }
+        if (g.videoInfo.duration_sec > 0) {
+            const int s = (int)g.videoInfo.duration_sec;
+            swprintf(buf, 64, L"%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60);
+            rows.emplace_back(L"Duration", buf);
+        }
+        if (g.videoInfo.video_codec[0]) rows.emplace_back(L"Video", g.videoInfo.video_codec);
+        if (g.videoInfo.audio_codec[0]) {
+            std::wstring a = g.videoInfo.audio_codec;
+            if (g.videoInfo.audio_tracks > 1)
+                a += L" (" + std::to_wstring(g.videoInfo.audio_tracks) + L" tracks)";
+            rows.emplace_back(L"Audio", a);
+        }
     }
     return rows;
 }
@@ -858,6 +949,39 @@ void Paint(HDC dcWin, const RECT& client) {
         SelectObject(dc, oldFont);
     }
 
+    if (ui.videoVisible) {
+        HBRUSH pb = CreateSolidBrush(kPanelBg);
+        FillRect(dc, &ui.videoBar, pb);
+        DeleteObject(pb);
+        const bool showPlay = !g.player || player_is_paused(g.player) || g.videoEnded;
+        DrawButton(dc, ui.playBtn, showPlay ? L"Play" : L"Pause", g.fontUi);
+
+        const double dur = g.player ? player_duration(g.player) : 0.0;
+        const double pos = g.videoEnded ? dur : (g.player ? player_position(g.player) : 0.0);
+        wchar_t buf[64];
+        swprintf(buf, 64, L"%d:%02d / %d:%02d", (int)pos / 60, (int)pos % 60,
+                 (int)dur / 60, (int)dur % 60);
+        RECT trc = {ui.playBtn.right + Scaled(8), ui.videoBar.top,
+                    ui.seekBar.left - Scaled(4), ui.videoBar.bottom};
+        HGDIOBJ oldFont = SelectObject(dc, g.fontUi);
+        SetTextColor(dc, kTextDim);
+        SetBkMode(dc, TRANSPARENT);
+        DrawTextW(dc, buf, -1, &trc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(dc, oldFont);
+
+        HBRUSH track = CreateSolidBrush(RGB(60, 60, 60));
+        FillRect(dc, &ui.seekBar, track);
+        DeleteObject(track);
+        if (dur > 0) {
+            const double f = (std::max)(0.0, (std::min)(1.0, pos / dur));
+            RECT fill = ui.seekBar;
+            fill.right = fill.left + (LONG)((ui.seekBar.right - ui.seekBar.left) * f);
+            HBRUSH fb = CreateSolidBrush(kAccent);
+            FillRect(dc, &fill, fb);
+            DeleteObject(fb);
+        }
+    }
+
     if (g.showDetails && g.cur >= 0) {
         auto rows = BuildDetails();
         const int pad = Scaled(12), lineH = Scaled(20), labelW = Scaled(100);
@@ -916,12 +1040,57 @@ void UpdateTitle() {
     SetWindowTextW(g.hwnd, t.c_str());
 }
 
+// Show/hide the video child and fit it to the image area, leaving the
+// transport strip at the bottom for the parent to draw into. Call wherever
+// the layout inputs change (size, DPI, filmstrip/grid toggles, navigation).
+void PositionVideoWindow() {
+    if (!g.videoWnd) return;
+    if (!g.videoMode || g.gridMode) {
+        ShowWindow(g.videoWnd, SW_HIDE);
+        return;
+    }
+    RECT rc = ClientRect();
+    Layout L = ComputeLayout(rc);
+    RECT v = L.imgArea;
+    if (g.showDetails && g.cur >= 0) {
+        // The parent can't draw the details panel over the child
+        // (WS_CLIPCHILDREN), so leave a band for it. Mirrors the panel
+        // metrics in Paint(): 12px margin + 12px padding + 20px rows.
+        v.top += Scaled(12) + 2 * Scaled(12) +
+                 (int)BuildDetails().size() * Scaled(20) + Scaled(8);
+    }
+    v.bottom = (std::max)(v.top + 1, v.bottom - Scaled(kVideoBarH));
+    SetWindowPos(g.videoWnd, nullptr, v.left, v.top, v.right - v.left,
+                 v.bottom - v.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (g.player) player_notify_resize(g.player);
+}
+
+void VideoPlayPause() {
+    if (!g.player || !g.videoMode) return;
+    if (g.videoEnded) {
+        player_seek_to(g.player, 0); // restart from the top after the end
+        if (player_is_paused(g.player)) player_toggle_pause(g.player);
+        g.videoEnded = false;
+    } else {
+        player_toggle_pause(g.player);
+    }
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+
+void VideoSeekBy(double seconds) {
+    if (!g.player || !g.videoMode) return;
+    player_seek_rel(g.player, seconds);
+    g.videoEnded = false;
+    InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+
 void PrefetchNeighbors() {
     const int n = (int)g.files.size();
     if (n <= 1 || g.cur < 0) return;
     for (int step : {1, -1}) {
         int idx = ((g.cur + step) % n + n) % n;
         if (idx == g.cur) continue;
+        if (IsVideoFile(g.files[idx])) continue; // videos have no decode path
         if (!CacheGet(CacheKey(g.files[idx], 0)))
             g.worker.RequestPrefetch(g.files[idx], 0);
     }
@@ -944,11 +1113,31 @@ void LoadCurrent() {
     g.dispW = g.dispH = 0;
     g.decodeFailed = false;
     g.decodePending = false;
+    g.videoEnded = false;
+    g.videoProbed = false;
+
+    const bool video = g.cur >= 0 && IsPlayableVideo(g.files[g.cur]);
+    if (g.videoMode && !video) {
+        if (g.player) player_close(g.player);
+        KillTimer(g.hwnd, kTimerVideo);
+    }
+    g.videoMode = video;
 
     if (g.cur >= 0) {
         const std::wstring& path = g.files[g.cur];
         CaptureLastWrite(path);
-        if (auto img = CacheGet(CacheKey(path, g.page))) {
+        if (video) {
+            // Close first so no stale event can carry the new generation,
+            // then open asynchronously; OPENED/ENDED/ERROR arrive as
+            // WM_APP_PLAYER. The worker probes metadata off the UI thread.
+            player_close(g.player);
+            player_set_event_callback(
+                g.player, OnPlayerEvent,
+                reinterpret_cast<void*>(static_cast<UINT_PTR>(++g.playerGen)));
+            player_open(g.player, path.c_str());
+            g.worker.RequestProbe(path);
+            SetTimer(g.hwnd, kTimerVideo, 250, nullptr);
+        } else if (auto img = CacheGet(CacheKey(path, g.page))) {
             g.disp = img;
             RebuildDisplayBitmap();
             PrefetchNeighbors();
@@ -958,6 +1147,7 @@ void LoadCurrent() {
         }
         g.strip.SetCurrent(g.cur);
     }
+    PositionVideoWindow();
     UpdateTitle();
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
@@ -1051,7 +1241,7 @@ void OpenTarget(const wchar_t* rawPath) {
         AdoptFileList({}, 0);
         StartListThread(path, true);
     } else {
-        if (!IsSupportedImage(path)) {
+        if (!IsSupportedImage(path) && !IsPlayableVideo(path)) {
             MessageBoxW(g.hwnd, L"This file type is not supported.", L"Photo Gallery",
                         MB_OK | MB_ICONINFORMATION);
             return;
@@ -1063,7 +1253,7 @@ void OpenTarget(const wchar_t* rawPath) {
 }
 
 void OpenDialog() {
-    std::wstring filter = OpenDialogFilter();
+    std::wstring filter = OpenDialogFilter(g.player != nullptr);
     wchar_t file[4096] = L"";
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
@@ -1098,11 +1288,11 @@ void HandleDrop(HDROP drop) {
     for (const auto& p : paths) {
         DWORD attr = GetFileAttributesW(p.c_str());
         if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY) &&
-            IsSupportedImage(p))
+            (IsSupportedImage(p) || IsPlayableVideo(p)))
             images.push_back(p);
     }
     if (images.empty()) {
-        MessageBoxW(g.hwnd, L"No supported images in the dropped items.", L"Photo Gallery",
+        MessageBoxW(g.hwnd, L"No supported files in the dropped items.", L"Photo Gallery",
                     MB_OK | MB_ICONINFORMATION);
         return;
     }
@@ -1143,6 +1333,11 @@ void DeleteAt(int index) {
     if (index < 0 || index >= (int)g.files.size()) return;
     const std::wstring path = g.files[index];
 
+    // A playing engine holds the file open, which makes the recycle-bin
+    // move fail silently — release it first.
+    const bool closedVideo = index == g.cur && g.videoMode;
+    if (closedVideo && g.player) player_close(g.player);
+
     IFileOperation* op = nullptr;
     if (FAILED(CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL,
                                 IID_IFileOperation, reinterpret_cast<void**>(&op))))
@@ -1162,7 +1357,10 @@ void DeleteAt(int index) {
         item->Release();
     }
     op->Release();
-    if (!deleted) return;
+    if (!deleted) {
+        if (closedVideo) LoadCurrent(); // reopen the video we closed above
+        return;
+    }
 
     CacheRemovePath(path);
     g.strip.InvalidateThumb(path);
@@ -1235,6 +1433,7 @@ void ZoomStep(double factor) {
 
 void ReloadIfChangedOnDisk() {
     if (g.cur < 0) return;
+    if (g.videoMode) return; // don't restart playback over a timestamp change
     const std::wstring& path = g.files[g.cur];
     WIN32_FILE_ATTRIBUTE_DATA fad{};
     if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
@@ -1261,7 +1460,7 @@ void OnDecoded(DecodeDone* d) {
     std::shared_ptr<DecodedImage> img(d->img);
     const std::wstring key = CacheKey(d->path, d->page);
     if (img) CachePut(key, img);
-    if (g.cur >= 0 && g.files[g.cur] == d->path && g.page == d->page) {
+    if (g.cur >= 0 && !g.videoMode && g.files[g.cur] == d->path && g.page == d->page) {
         g.decodePending = false;
         if (img) {
             g.disp = img;
@@ -1291,6 +1490,43 @@ void OnSaved(SaveDone* d) {
     } else {
         InvalidateRect(g.hwnd, nullptr, FALSE);
     }
+}
+
+void OnProbed(ProbeDone* d) {
+    std::unique_ptr<ProbeDone> owner(d);
+    if (!d->ok || !g.videoMode || g.cur < 0 || g.files[g.cur] != d->path) return;
+    g.videoInfo = d->info;
+    g.videoProbed = true;
+    if (g.showDetails) {
+        PositionVideoWindow(); // the panel gained rows; move the child down
+        InvalidateRect(g.hwnd, nullptr, FALSE);
+    }
+}
+
+// Marshaled engine events (posted by OnPlayerEvent); stale generations are
+// events from a media we already navigated away from.
+void OnPlayerMessage(WPARAM evt, LPARAM gen) {
+    if (!g.videoMode || static_cast<unsigned>(gen) != g.playerGen) return;
+    switch (static_cast<PlayerEvent>(evt)) {
+        case PLAYER_EVT_OPENED:
+            break; // duration/position are valid now; repaint below
+        case PLAYER_EVT_ENDED:
+            g.videoEnded = true;
+            if (g.videoAdvance && g.files.size() > 1) {
+                NavigateTo(g.cur + 1); // slideshow-style advance (opt-in)
+                return;
+            }
+            break;
+        case PLAYER_EVT_ERROR:
+            // Fall back to the standard "Can't display this file." surface.
+            g.videoMode = false;
+            g.decodeFailed = true;
+            if (g.player) player_close(g.player);
+            KillTimer(g.hwnd, kTimerVideo);
+            PositionVideoWindow();
+            break;
+    }
+    InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 
 void OnListDone(ListDone* d) {
@@ -1354,10 +1590,12 @@ void OnCommand(WORD id) {
             break;
         case IDM_DETAILS:
             g.showDetails = !g.showDetails;
+            PositionVideoWindow(); // the child leaves room for the panel
             InvalidateRect(g.hwnd, nullptr, FALSE);
             break;
         case IDM_FILMSTRIP:
             g.showFilmstrip = !g.showFilmstrip;
+            PositionVideoWindow();
             InvalidateRect(g.hwnd, nullptr, FALSE);
             break;
         case IDM_GRID: ToggleGrid(); break;
@@ -1391,6 +1629,18 @@ void OnCommand(WORD id) {
             if (g.gridMode) GridMoveSel(-g.gridCols);
             else SetPage((int)g.page - 1);
             break;
+        case IDM_PLAYPAUSE:
+            if (!g.gridMode) VideoPlayPause();
+            break;
+        case IDM_SEEK_FWD:
+            if (!g.gridMode) VideoSeekBy(10);
+            break;
+        case IDM_SEEK_BACK:
+            if (!g.gridMode) VideoSeekBy(-10);
+            break;
+        case IDM_VIDEO_ADVANCE:
+            g.videoAdvance = !g.videoAdvance;
+            break;
         default: break;
     }
 }
@@ -1414,6 +1664,13 @@ void OnInitMenuPopup(HMENU menu) {
     enable(IDM_PREV, g.files.size() > 1);
     enable(IDM_PAGE_NEXT, g.gridMode ? haveAny : (haveDisp && g.disp->pageCount > 1));
     enable(IDM_PAGE_PREV, g.gridMode ? haveAny : (haveDisp && g.disp->pageCount > 1));
+    const bool video = g.videoMode && !g.gridMode;
+    enable(IDM_PLAYPAUSE, video);
+    enable(IDM_SEEK_FWD, video);
+    enable(IDM_SEEK_BACK, video);
+    enable(IDM_VIDEO_ADVANCE, g.player != nullptr);
+    CheckMenuItem(menu, IDM_VIDEO_ADVANCE,
+                  MF_BYCOMMAND | (g.videoAdvance ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_DETAILS,
                   MF_BYCOMMAND | (g.showDetails ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_FILMSTRIP,
@@ -1432,6 +1689,23 @@ void OnLButtonDown(POINT pt) {
     }
     Layout L = ComputeLayout(rc);
     UiRects ui = ComputeUiRects(L.imgArea);
+
+    if (ui.videoVisible) {
+        if (PtInRect(&ui.playBtn, pt)) { VideoPlayPause(); return; }
+        // The whole bar height around the thin seek line is clickable.
+        RECT seekHit = {ui.seekBar.left, ui.videoBar.top, ui.seekBar.right, ui.videoBar.bottom};
+        if (PtInRect(&seekHit, pt)) {
+            const double dur = g.player ? player_duration(g.player) : 0.0;
+            if (dur > 0) {
+                const double w = (std::max)(1L, ui.seekBar.right - ui.seekBar.left);
+                player_seek_to(g.player, dur * (pt.x - ui.seekBar.left) / w);
+                g.videoEnded = false;
+                InvalidateRect(g.hwnd, nullptr, FALSE);
+            }
+            return;
+        }
+        if (PtInRect(&ui.videoBar, pt)) return; // dead space on the bar
+    }
 
     if (ui.barVisible && PtInRect(&ui.rotCcw, pt)) { RotateView(-1); return; }
     if (ui.barVisible && PtInRect(&ui.rotCw, pt)) { RotateView(1); return; }
@@ -1489,6 +1763,11 @@ void OnMouseWheel(POINT screenPt, int delta, bool ctrl) {
         InvalidateRect(g.hwnd, nullptr, FALSE);
         return;
     }
+    if (g.videoMode) {
+        // Wheel over the video adjusts volume (forwarded by VideoWndProc too).
+        if (g.player) player_volume_step(g.player, delta / 120);
+        return;
+    }
     ZoomAt(pt, std::pow(1.25, delta / 120.0));
 }
 
@@ -1504,6 +1783,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_ERASEBKGND:
             return 1;
         case WM_SIZE:
+            PositionVideoWindow();
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         case WM_GETMINMAXINFO: {
@@ -1545,6 +1825,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 KillTimer(hwnd, kTimerHq);
                 g.interactive = false;
                 InvalidateRect(hwnd, nullptr, FALSE);
+            } else if (wParam == kTimerVideo && g.videoMode) {
+                InvalidateRect(hwnd, nullptr, FALSE); // transport bar progress
             }
             return 0;
         case WM_DROPFILES:
@@ -1558,6 +1840,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             const RECT* r = reinterpret_cast<const RECT*>(lParam);
             SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left,
                          r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+            PositionVideoWindow(); // the scaled transport strip moved
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
@@ -1576,6 +1859,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
+        case WM_APP_PLAYER:
+            OnPlayerMessage(wParam, lParam);
+            return 0;
+        case WM_APP_PROBED:
+            OnProbed(reinterpret_cast<ProbeDone*>(lParam));
+            return 0;
         case WM_CLOSE:
             // Last chance to persist an unsaved rotation (synchronous: we're exiting).
             if (g.rot != 0 && g.disp && g.cur >= 0) {
@@ -1594,11 +1883,32 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
                 g.rot = 0;
             }
+            if (g.player) player_close(g.player); // detach D3D before the child dies
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
             PostQuitMessage(0);
             return 0;
+        default:
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+}
+
+// Video child: D3D renders here; forward input to the parent so its hit
+// testing (transport bar, wheel volume) and accelerators keep working.
+LRESULT CALLBACK VideoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_LBUTTONDOWN: {
+            POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            MapWindowPoints(hwnd, GetParent(hwnd), &pt, 1);
+            return SendMessageW(GetParent(hwnd), msg, wParam, MAKELPARAM(pt.x, pt.y));
+        }
+        case WM_MOUSEWHEEL: // lParam is already in screen coordinates
+            return SendMessageW(GetParent(hwnd), msg, wParam, lParam);
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE; // keep focus (and accelerators) on the parent
+        case WM_ERASEBKGND:
+            return 1; // D3D owns this surface
         default:
             return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
@@ -1623,13 +1933,30 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     wc.lpszClassName = L"PhotoGalleryWnd";
     if (!RegisterClassExW(&wc)) return 1;
 
+    // WS_CLIPCHILDREN: Paint() BitBlts the whole client; without it every
+    // repaint would stomp the D3D video child.
     g.hwnd = CreateWindowExW(0, wc.lpszClassName, L"Photo Gallery",
-                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                             CW_USEDEFAULT, CW_USEDEFAULT,
                              1100, 800, nullptr, nullptr, hInst, nullptr);
     if (!g.hwnd) return 1;
     g.dpi = (int)GetDpiForWindow(g.hwnd);
     g.accel = LoadAcceleratorsW(hInst, MAKEINTRESOURCEW(IDR_ACCEL));
     DragAcceptFiles(g.hwnd, TRUE);
+
+    // Video child + engine. A null player (stub build, or D3D11 init
+    // failure) simply leaves video files unsupported.
+    WNDCLASSEXW vc{};
+    vc.cbSize = sizeof(vc);
+    vc.lpfnWndProc = VideoWndProc;
+    vc.hInstance = hInst;
+    vc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    vc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+    vc.lpszClassName = L"PhotoGalleryVideo";
+    if (RegisterClassExW(&vc))
+        g.videoWnd = CreateWindowExW(0, vc.lpszClassName, nullptr, WS_CHILD, 0, 0,
+                                     1, 1, g.hwnd, nullptr, hInst, nullptr);
+    if (g.videoWnd) g.player = player_create(g.videoWnd);
 
     g.worker.Start(g.hwnd);
     g.strip.Start(g.hwnd, WM_APP_THUMB);
@@ -1654,6 +1981,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
 
     g.worker.Stop();
     g.strip.Stop();
+    if (g.player) {
+        player_destroy(g.player);
+        g.player = nullptr;
+    }
     if (g.displayBmp) DeleteObject(g.displayBmp);
     if (g.fontUi) DeleteObject(g.fontUi);
     if (g.fontSym) DeleteObject(g.fontSym);

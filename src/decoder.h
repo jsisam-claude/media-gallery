@@ -38,5 +38,6 @@ void ShutdownDecoders();
 const std::vector<ImageDecoder*>& Decoders();
 ImageDecoder* FindDecoder(const std::wstring& path); // by extension, nullptr if none
 bool IsSupportedImage(const std::wstring& path);
+bool IsVideoFile(const std::wstring& path);          // video container by extension
 std::wstring FileExtLower(const std::wstring& path); // "jpg" (no dot), lowercase
-std::wstring OpenDialogFilter();                     // GetOpenFileName filter (embedded NULs)
+std::wstring OpenDialogFilter(bool includeVideo);    // GetOpenFileName filter (embedded NULs)

@@ -20,3 +20,7 @@
 #define IDM_PAGE_NEXT       40015
 #define IDM_PAGE_PREV       40016
 #define IDM_GRID            40017
+#define IDM_PLAYPAUSE       40018
+#define IDM_SEEK_FWD        40019
+#define IDM_SEEK_BACK       40020
+#define IDM_VIDEO_ADVANCE   40021

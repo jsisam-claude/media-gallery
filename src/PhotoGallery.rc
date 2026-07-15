@@ -33,6 +33,11 @@ BEGIN
         MENUITEM "&Previous Image\tLeft",       IDM_PREV
         MENUITEM "Next Pa&ge\tDown",            IDM_PAGE_NEXT
         MENUITEM "Previo&us Page\tUp",          IDM_PAGE_PREV
+        MENUITEM SEPARATOR
+        MENUITEM "Pla&y/Pause Video\tSpace",    IDM_PLAYPAUSE
+        MENUITEM "Seek For&ward\tCtrl+Right",   IDM_SEEK_FWD
+        MENUITEM "Seek Bac&k\tCtrl+Left",       IDM_SEEK_BACK
+        MENUITEM "&Auto-Advance After Video",   IDM_VIDEO_ADVANCE
     END
 END
 
@@ -61,6 +66,9 @@ BEGIN
     VK_UP,      IDM_PAGE_PREV,  VIRTKEY
     VK_NEXT,    IDM_PAGE_NEXT,  VIRTKEY
     VK_PRIOR,   IDM_PAGE_PREV,  VIRTKEY
+    VK_SPACE,   IDM_PLAYPAUSE,  VIRTKEY
+    VK_RIGHT,   IDM_SEEK_FWD,   VIRTKEY, CONTROL
+    VK_LEFT,    IDM_SEEK_BACK,  VIRTKEY, CONTROL
 END
 
 // Application manifest (DPI awareness, asInvoker)
