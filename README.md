@@ -81,22 +81,30 @@ third-party SDKs, no vcpkg/NuGet, no downloads. **Video playback is built
 only by the CMake + MSVC route** (it compiles the vendored FFmpeg subset);
 every other route produces the image-only viewer:
 
-**Visual Studio (recommended)** — VS 2022 with the *Desktop development with
-C++* workload (MFC not required). Open **`PhotoGallery.sln`** and build
-(x64, Debug/Release), or from a command prompt:
+**Full app with video (recommended)** — VS 2022+ with the *Desktop
+development with C++* workload (includes CMake and Ninja). From an
+**x64 Native Tools Command Prompt for VS** (the plain Developer Prompt
+targets x86 and the link fails):
+
+    cmake --preset x64-release
+    cmake --build --preset x64-release
+
+Output: `build\x64-release\PhotoGallery.exe`. The first build compiles
+the vendored FFmpeg sources (a few minutes, once). In the VS IDE, use
+*File → Open → Folder* on the repo — it picks up the presets. This is
+what CI builds and uploads as an artifact on every push.
+
+**Image-only routes** (no video, identical to the pre-video viewer):
+
+Visual Studio solution — open **`PhotoGallery.sln`** and build (x64), or:
 
     msbuild PhotoGallery.sln -p:Configuration=Release -p:Platform=x64
 
-CMake also works if you prefer it (*File → Open → Folder*, or):
-
-    cmake -B build -G "Visual Studio 17 2022" -A x64
-    cmake --build build --config Release
-
-**Plain MSVC, no CMake** — from an *x64 Native Tools Command Prompt*:
+Plain MSVC, no CMake — from an *x64 Native Tools Command Prompt*:
 
     build.bat
 
-**MinGW-w64 / cross-compile** (also used for CI-style verification):
+MinGW-w64 / cross-compile (also used for CI-style verification):
 
     make            # cross from Linux, or: mingw32-make CXX=g++ WINDRES=windres on MSYS2
 
