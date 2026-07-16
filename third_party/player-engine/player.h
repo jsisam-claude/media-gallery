@@ -31,13 +31,13 @@ void player_frame_step(Player* p);  // pauses if playing, then advances one fram
 void player_seek_rel(Player* p, double seconds);
 void player_seek_to(Player* p, double seconds);
 void player_volume_step(Player* p, int steps);
-void player_volume_set(Player* p, float v);  // 0..1
+void player_volume_set(Player* p, float v);  // 0..2; >1 boosts in software
 float player_volume(Player* p);
 void player_set_mute(Player* p, bool mute);
 bool player_is_muted(Player* p);
 
-// Playback speed 0.25..4 (audio pitch shifts with rate). Persists across
-// files within the session.
+// Playback speed 0.25..4, pitch-preserving (WSOLA time stretch). Persists
+// across files within the session.
 void player_set_speed(Player* p, double s);
 double player_speed(Player* p);
 // Sync corrections in seconds, reset on every open. Positive audio delay
@@ -46,6 +46,9 @@ void player_set_audio_delay(Player* p, double s);
 double player_audio_delay(Player* p);
 void player_set_sub_delay(Player* p, double s);
 double player_sub_delay(Player* p);
+// Subtitle text size multiplier, 0.5..2 (1 = default).
+void player_set_sub_scale(Player* p, double s);
+double player_sub_scale(Player* p);
 
 // Audio output endpoints. Enumeration is standalone (COM-initialized
 // thread); selection by endpoint id, NULL = follow the system default.
@@ -80,6 +83,18 @@ void player_chapter_name(Player* p, int i, wchar_t* buf, size_t buflen);
 int player_chapter_current(Player* p);          // index, -1 when none
 void player_chapter_go(Player* p, int i);       // seek to chapter i
 int player_chapter_seek(Player* p, int delta);  // jump +-N; returns target or -1
+
+// Picture controls, -100..100 each (0 = neutral). Applied by the GPU video
+// processor; ignored on the shader fallback path.
+void player_set_picture(Player* p, int brightness, int contrast,
+                        int saturation, int hue);
+void player_get_picture(Player* p, int* brightness, int* contrast,
+                        int* saturation, int* hue);
+// Aspect override: 0 auto, 1 force 16:9, 2 force 4:3, 3 stretch, 4 crop-fill.
+void player_set_aspect(Player* p, int mode);
+int player_aspect(Player* p);
+// Debug HUD (fps, drops, decode path, queue depths); returns the new state.
+bool player_toggle_hud(Player* p);
 
 // Saves the currently displayed frame as a PNG (synchronous, WIC encoder;
 // call from a COM-initialized thread). Applies aspect ratio and rotation.

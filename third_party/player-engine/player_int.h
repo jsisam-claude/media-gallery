@@ -149,7 +149,7 @@ public:
     void flush();                 // seek: clear FIFO, clock invalid until next frame
     double clock();               // playback pts in seconds; NAN when unknown
     void volume_step(int steps);  // +-5% per step
-    void volume_set(float v);     // 0..1
+    void volume_set(float v);     // 0..2; >1 = session max + software gain
     float volume();
     void set_mute(bool m);
     bool muted();
@@ -168,6 +168,7 @@ private:
     std::wstring want_dev_;       // endpoint id; empty = system default
     std::atomic<bool> dev_change_{false};
     std::atomic<double> speed_{1.0};
+    std::atomic<float> gain_{1.0f};       // software gain (volume above 100%)
     std::atomic<float> want_vol_{-1.0f};  // last requested; reapplied on reopen
     std::atomic<int> want_mute_{-1};
     FrameQueue* fq_ = nullptr;
@@ -204,6 +205,14 @@ public:
     // feeds the video processor with zero copies). Null when the device has
     // no video API (shader fallback) - callers then decode in software.
     ID3D11Device* decode_device();
+    // ProcAmp picture controls (-100..100; VideoProcessor path only) and
+    // aspect override (0 auto, 1 16:9, 2 4:3, 3 stretch, 4 crop-fill).
+    void set_picture(int b, int c, int s, int h);
+    void get_picture(int* b, int* c, int* s, int* h);
+    void set_aspect(int mode);
+    int aspect();
+    void set_sub_scale(double s);  // 0.5..2 text size multiplier
+    double sub_scale();
     ~VideoOut() { shutdown(); }
 
 private:
@@ -287,6 +296,11 @@ struct Player {
     std::atomic<double> speed{1.0};       // 0.25..4
     std::atomic<double> audio_delay{0};   // s; + = audio heard later
     std::atomic<double> sub_delay{0};     // s; + = subtitles shown later
+
+    // debug HUD + counters (render thread computes fps itself)
+    std::atomic<bool> hud{false};
+    std::atomic<int> stat_drops{0};
+    std::atomic<bool> hw_active{false};   // D3D11VA negotiated by get_format
 
     // external clock fallback when there is no audio stream
     std::mutex extclk_m;

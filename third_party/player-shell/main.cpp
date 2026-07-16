@@ -8,6 +8,7 @@
 #include <shlwapi.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <dwmapi.h>
 #include <cstdio>
 #include <algorithm>
 #include <condition_variable>
@@ -36,6 +37,9 @@ enum {
     IDM_NEXTFILE, IDM_PREVFILE, IDM_AUTONEXT, IDM_EXIT,
     IDM_SNAPSHOT, IDM_PL_SAVE, IDM_REP_OFF, IDM_REP_ALL, IDM_REP_ONE,
     IDM_SHUFFLE, IDM_OPENURL,
+    IDM_PIC_BR_UP, IDM_PIC_BR_DN, IDM_PIC_CO_UP, IDM_PIC_CO_DN,
+    IDM_PIC_SA_UP, IDM_PIC_SA_DN, IDM_PIC_HU_UP, IDM_PIC_HU_DN,
+    IDM_PIC_RESET, IDM_ASSOC, IDM_SUB_BIGGER, IDM_SUB_SMALLER,
     IDM_STRACK_OFF = 299, IDM_ATRACK_BASE = 300, IDM_STRACK_BASE = 400,
     IDM_CHAP_BASE = 500,  // ..563
     IDM_ADEV_DEFAULT = 599, IDM_ADEV_BASE = 600,  // ..631
@@ -71,8 +75,10 @@ static HICON g_ic_prev = nullptr, g_ic_play = nullptr, g_ic_pause = nullptr,
 static bool g_autonext = false;
 static bool g_have_placement = false;
 static WINDOWPLACEMENT g_loaded_placement = {sizeof(WINDOWPLACEMENT)};
-static int g_loaded_vol = -1;   // 0..100, -1 = not in state file
+static int g_loaded_vol = -1;   // 0..200, -1 = not in state file
 static int g_loaded_mute = 0;
+static bool g_loaded_fs = false;
+static int g_loaded_subscale = 100;
 
 static bool is_video_ext(const wchar_t* path) {
     const wchar_t* dot = wcsrchr(path, L'.');
@@ -97,6 +103,9 @@ static void save_state(HWND hwnd) {
     if (!f) return;
     fwprintf(f, L"A|%d\n", g_autonext ? 1 : 0);
     fwprintf(f, L"P|%d|%d\n", g_repeat, g_shuffle ? 1 : 0);
+    fwprintf(f, L"F|%d\n", g_fullscreen ? 1 : 0);
+    if (g_player)
+        fwprintf(f, L"S|%d\n", (int)(player_sub_scale(g_player) * 100 + 0.5));
     if (g_player)
         fwprintf(f, L"V|%d|%d\n", (int)(player_volume(g_player) * 100 + 0.5f),
                  player_is_muted(g_player) ? 1 : 0);
@@ -137,6 +146,11 @@ static void load_state() {
                 g_repeat = r;
                 g_shuffle = s == 1;
             }
+        } else if (line[0] == L'F' && line[1] == L'|') {
+            g_loaded_fs = line[2] == L'1';
+        } else if (line[0] == L'S' && line[1] == L'|') {
+            int s = _wtoi(line + 2);
+            if (s >= 50 && s <= 200) g_loaded_subscale = s;
         } else if (line[0] == L'W' && line[1] == L'|') {
             WINDOWPLACEMENT& wp = g_loaded_placement;
             unsigned cmd = SW_SHOWNORMAL;
@@ -149,7 +163,7 @@ static void load_state() {
             }
         } else if (line[0] == L'V' && line[1] == L'|') {
             int v = -1, m = 0;
-            if (swscanf(line + 2, L"%d|%d", &v, &m) >= 1 && v >= 0 && v <= 100) {
+            if (swscanf(line + 2, L"%d|%d", &v, &m) >= 1 && v >= 0 && v <= 200) {
                 g_loaded_vol = v;
                 g_loaded_mute = m;
             }
@@ -501,6 +515,64 @@ static void update_ui(HWND hwnd) {
     SetWindowTextW(g_play, paused || ended || !media ? L"Play" : L"Pause");
 }
 
+// ------------------------------------- desktop integration helpers
+
+// Per-user (HKCU, no elevation) ProgID + OpenWithProgids entries so the
+// player appears in Explorer's "Open with" for the supported types.
+static void register_associations(HWND hwnd) {
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    wchar_t cmd[MAX_PATH + 16], icon[MAX_PATH + 8];
+    swprintf(cmd, MAX_PATH + 16, L"\"%s\" \"%%1\"", exe);
+    swprintf(icon, MAX_PATH + 8, L"%s,0", exe);
+
+    auto setkey = [](const std::wstring& sub, const wchar_t* name,
+                     const wchar_t* val) {
+        HKEY k;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, sub.c_str(), 0, nullptr, 0,
+                            KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS)
+            return false;
+        LONG r = RegSetValueExW(k, name, 0, REG_SZ, (const BYTE*)val,
+                                (DWORD)((wcslen(val) + 1) * sizeof(wchar_t)));
+        RegCloseKey(k);
+        return r == ERROR_SUCCESS;
+    };
+
+    const wchar_t* progid = L"Software\\Classes\\minimal-player.video";
+    bool ok = setkey(progid, nullptr, L"Video file (minimal-player)");
+    ok = setkey(std::wstring(progid) + L"\\DefaultIcon", nullptr, icon) && ok;
+    ok = setkey(std::wstring(progid) + L"\\shell\\open\\command", nullptr, cmd) && ok;
+    for (const wchar_t* ext : {L".mp4", L".m4v", L".mov", L".mkv", L".webm",
+                               L".avi", L".m3u", L".m3u8"})
+        ok = setkey(std::wstring(L"Software\\Classes\\") + ext +
+                        L"\\OpenWithProgids",
+                    L"minimal-player.video", L"") &&
+             ok;
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+    MessageBoxW(hwnd,
+                ok ? L"Registered for the current user. Pick minimal-player "
+                     L"under \"Open with\" in Explorer (no admin needed)."
+                   : L"Could not write the registration keys.",
+                APP_TITLE, MB_OK | (ok ? MB_ICONINFORMATION : MB_ICONERROR));
+}
+
+// Dark title bar when Windows apps are in dark mode (best effort).
+static void apply_dark_titlebar(HWND hwnd) {
+    HKEY k;
+    DWORD light = 1, sz = sizeof(light);
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes"
+                      L"\\Personalize",
+                      0, KEY_READ, &k) == ERROR_SUCCESS) {
+        RegQueryValueExW(k, L"AppsUseLightTheme", nullptr, nullptr,
+                         (BYTE*)&light, &sz);
+        RegCloseKey(k);
+    }
+    BOOL dark = light == 0;
+    DwmSetWindowAttribute(hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark,
+                          sizeof(dark));
+}
+
 // ------------------------------------------------ snapshot + taskbar
 
 static void do_snapshot(HWND) {
@@ -661,6 +733,8 @@ static void open_path(HWND hwnd, const wchar_t* path) {
     preview_clear_cache();
     g_loop_a = g_loop_b = -1;
     g_stall_pos = -1;
+    if (!g_cur_is_url)
+        SHAddToRecentDocs(SHARD_PATHW, path);  // taskbar "Recent" jump list
     player_open(g_player, path);
     update_ui(hwnd);
 }
@@ -911,6 +985,20 @@ static void show_context_menu(HWND hwnd, int x, int y) {
     }
     AppendMenuW(m, MF_STRING | (media ? 0 : MF_GRAYED), IDM_SNAPSHOT,
                 L"Save Snapshot\tF12");
+    if (media) {
+        HMENU pic = CreatePopupMenu();
+        AppendMenuW(pic, MF_STRING, IDM_PIC_BR_UP, L"Brightness +");
+        AppendMenuW(pic, MF_STRING, IDM_PIC_BR_DN, L"Brightness −");
+        AppendMenuW(pic, MF_STRING, IDM_PIC_CO_UP, L"Contrast +");
+        AppendMenuW(pic, MF_STRING, IDM_PIC_CO_DN, L"Contrast −");
+        AppendMenuW(pic, MF_STRING, IDM_PIC_SA_UP, L"Saturation +");
+        AppendMenuW(pic, MF_STRING, IDM_PIC_SA_DN, L"Saturation −");
+        AppendMenuW(pic, MF_STRING, IDM_PIC_HU_UP, L"Hue +");
+        AppendMenuW(pic, MF_STRING, IDM_PIC_HU_DN, L"Hue −");
+        AppendMenuW(pic, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(pic, MF_STRING, IDM_PIC_RESET, L"Reset");
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)pic, L"Picture");
+    }
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     int ac = media ? player_audio_track_count(g_player) : 0;
     if (ac > 0) {
@@ -935,6 +1023,9 @@ static void show_context_menu(HWND hwnd, int x, int y) {
             AppendMenuW(sm, MF_STRING | (i == cur ? MF_CHECKED : 0),
                         IDM_STRACK_BASE + i, nm);
         }
+        AppendMenuW(sm, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(sm, MF_STRING, IDM_SUB_BIGGER, L"Larger Text");
+        AppendMenuW(sm, MF_STRING, IDM_SUB_SMALLER, L"Smaller Text");
         AppendMenuW(m, MF_POPUP, (UINT_PTR)sm, L"Subtitles\tS");
     }
     int cc = media ? player_chapter_count(g_player) : 0;
@@ -975,6 +1066,7 @@ static void show_context_menu(HWND hwnd, int x, int y) {
     AppendMenuW(m, MF_STRING | (g_player && player_is_muted(g_player) ? MF_CHECKED : 0),
                 IDM_MUTE, L"Mute\tM");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, IDM_ASSOC, L"Register File Types (per user)...");
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"Exit\tQ");
     TrackPopupMenu(m, TPM_RIGHTBUTTON, x, y, 0, hwnd, nullptr);
     DestroyMenu(m);
@@ -1034,6 +1126,19 @@ static void on_key(HWND hwnd, WPARAM key) {
         case 'P': media_next(hwnd, -1, false); break;
         case VK_F12: do_snapshot(hwnd); break;
         case 'F': toggle_fullscreen(hwnd); break;
+        case 'V': {
+            static const wchar_t* names[] = {L"Aspect: Auto", L"Aspect: 16:9",
+                                             L"Aspect: 4:3", L"Aspect: Stretch",
+                                             L"Aspect: Crop-fill"};
+            int mode = (player_aspect(g_player) + 1) % 5;
+            player_set_aspect(g_player, mode);
+            osd(names[mode]);
+            break;
+        }
+        case 'D':
+            if (GetKeyState(VK_CONTROL) & 0x8000)
+                player_toggle_hud(g_player);
+            break;
         case 'O': open_dialog(hwnd); break;
         case 'U':
             if (GetKeyState(VK_CONTROL) & 0x8000) {
@@ -1138,6 +1243,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDC_FWD: if (g_player) player_seek_rel(g_player, 10); break;
                 case IDC_FULL: toggle_fullscreen(hwnd); break;
                 case IDM_OPEN: open_dialog(hwnd); break;
+                case IDM_ASSOC: register_associations(hwnd); break;
+                case IDM_SUB_BIGGER:
+                case IDM_SUB_SMALLER:
+                    if (g_player) {
+                        double s = player_sub_scale(g_player) *
+                                   (LOWORD(wp) == IDM_SUB_BIGGER ? 1.1 : 1 / 1.1);
+                        player_set_sub_scale(g_player, s);
+                        wchar_t b[48];
+                        swprintf(b, 48, L"Subtitle size %d%%",
+                                 (int)(player_sub_scale(g_player) * 100 + 0.5));
+                        osd(b);
+                    }
+                    break;
                 case IDM_OPENURL: {
                     std::wstring url;
                     if (open_url_dialog(hwnd, url)) open_any(hwnd, url.c_str());
@@ -1150,6 +1268,50 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDT_PLAY: play_pause(); break;
                 case IDM_AUTONEXT: g_autonext = !g_autonext; break;
                 case IDM_SNAPSHOT: do_snapshot(hwnd); break;
+                case IDM_PIC_BR_UP:
+                case IDM_PIC_BR_DN:
+                case IDM_PIC_CO_UP:
+                case IDM_PIC_CO_DN:
+                case IDM_PIC_SA_UP:
+                case IDM_PIC_SA_DN:
+                case IDM_PIC_HU_UP:
+                case IDM_PIC_HU_DN:
+                case IDM_PIC_RESET:
+                    if (g_player) {
+                        int b, c, s, h;
+                        player_get_picture(g_player, &b, &c, &s, &h);
+                        int id = LOWORD(wp);
+                        const wchar_t* what = L"Picture";
+                        int val = 0;
+                        if (id == IDM_PIC_RESET) {
+                            b = c = s = h = 0;
+                        } else if (id == IDM_PIC_BR_UP || id == IDM_PIC_BR_DN) {
+                            b += id == IDM_PIC_BR_UP ? 10 : -10;
+                            what = L"Brightness";
+                            val = b;
+                        } else if (id == IDM_PIC_CO_UP || id == IDM_PIC_CO_DN) {
+                            c += id == IDM_PIC_CO_UP ? 10 : -10;
+                            what = L"Contrast";
+                            val = c;
+                        } else if (id == IDM_PIC_SA_UP || id == IDM_PIC_SA_DN) {
+                            s += id == IDM_PIC_SA_UP ? 10 : -10;
+                            what = L"Saturation";
+                            val = s;
+                        } else {
+                            h += id == IDM_PIC_HU_UP ? 10 : -10;
+                            what = L"Hue";
+                            val = h;
+                        }
+                        player_set_picture(g_player, b, c, s, h);
+                        player_get_picture(g_player, &b, &c, &s, &h);  // clamped
+                        wchar_t ob[48];
+                        if (id == IDM_PIC_RESET)
+                            wcscpy(ob, L"Picture reset");
+                        else
+                            swprintf(ob, 48, L"%s %+d", what, val);
+                        osd(ob);
+                    }
+                    break;
                 case IDM_PL_SAVE: playlist_save_dialog(hwnd); break;
                 case IDM_REP_OFF: g_repeat = 0; break;
                 case IDM_REP_ALL: g_repeat = 1; break;
@@ -1304,6 +1466,25 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             delete r;
             return 0;
         }
+        case WM_COPYDATA: {
+            // A second launch hands its file(s) over and exits (dwData 1 =
+            // open, 2 = enqueue into the playlist).
+            COPYDATASTRUCT* cds = (COPYDATASTRUCT*)lp;
+            if (cds && cds->lpData && cds->cbData >= sizeof(wchar_t)) {
+                std::wstring path((const wchar_t*)cds->lpData,
+                                  cds->cbData / sizeof(wchar_t));
+                while (!path.empty() && path.back() == 0) path.pop_back();
+                if (!path.empty()) {
+                    if (cds->dwData == 2)
+                        g_playlist.push_back(path);
+                    else
+                        open_any(hwnd, path.c_str());
+                    if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+                    SetForegroundWindow(hwnd);
+                }
+            }
+            return TRUE;
+        }
         case MSG_PLAYER_EVENT:
             if ((PlayerEvent)wp == PLAYER_EVT_ERROR && g_player) {
                 wchar_t err[512];
@@ -1344,6 +1525,57 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int show) {
         FILE* f = nullptr;
         freopen_s(&f, "CONOUT$", "w", stderr);
     }
+
+    // Headless probe mode: exit codes 0 ok / 1 unreadable / 2 usage. CI
+    // executes this as a smoke test, so a broken binary fails the build.
+    {
+        int argc = 0;
+        wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (argv && argc >= 2 && !_wcsicmp(argv[1], L"--probe")) {
+            FILE* fo = nullptr;
+            freopen_s(&fo, "CONOUT$", "w", stdout);
+            int rc = 2;
+            if (argc >= 3) {
+                PlayerMediaInfo info;
+                bool ok = player_probe(argv[2], &info);
+                if (ok)
+                    wprintf(L"ok %dx%d %.1fs video=%ls audio_tracks=%d subs=%d\n",
+                            info.width, info.height, info.duration_sec,
+                            info.video_codec, info.audio_tracks, info.sub_tracks);
+                else
+                    wprintf(L"probe failed\n");
+                rc = ok ? 0 : 1;
+            } else {
+                wprintf(L"usage: minimal-player --probe <file-or-url>\n");
+            }
+            LocalFree(argv);
+            return rc;
+        }
+        if (argv) LocalFree(argv);
+    }
+    // Single instance: hand the command line to the running player instead
+    // of opening a second window.
+    HANDLE single = CreateMutexW(nullptr, TRUE, L"minimal-player-single-instance");
+    if (single && GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND other = FindWindowW(L"minimal_player_wnd", nullptr);
+        if (other) {
+            int argc = 0;
+            wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+            if (argv) {
+                for (int i = 1; i < argc; i++) {
+                    COPYDATASTRUCT cds = {};
+                    cds.dwData = i == 1 ? 1 : 2;  // open first, enqueue rest
+                    cds.cbData = (DWORD)((wcslen(argv[i]) + 1) * sizeof(wchar_t));
+                    cds.lpData = argv[i];
+                    SendMessageW(other, WM_COPYDATA, 0, (LPARAM)&cds);
+                }
+                LocalFree(argv);
+            }
+            SetForegroundWindow(other);
+            return 0;
+        }
+    }
+
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     srand(GetTickCount());
     g_msg_tbcreated = RegisterWindowMessageW(L"TaskbarButtonCreated");
@@ -1399,7 +1631,7 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int show) {
     g_full = CreateWindowExW(0, L"BUTTON", L"Full", WS_CHILD | WS_VISIBLE,
                              0, 0, 0, 0, g_main, (HMENU)IDC_FULL, hinst, nullptr);
     SendMessageW(g_seek, TBM_SETRANGE, TRUE, MAKELPARAM(0, SEEK_RANGE));
-    SendMessageW(g_vol, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
+    SendMessageW(g_vol, TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));  // >100% boosts
     SendMessageW(g_vol, TBM_SETPOS, TRUE, 100);
 
     g_preview = CreateWindowExW(
@@ -1422,14 +1654,18 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int show) {
         player_volume_set(g_player, g_loaded_vol / 100.0f);
         player_set_mute(g_player, g_loaded_mute > 0);
     }
+    if (g_loaded_subscale != 100)
+        player_set_sub_scale(g_player, g_loaded_subscale / 100.0);
     SendMessageW(g_vol, TBM_SETPOS, TRUE, (LPARAM)(player_volume(g_player) * 100));
 
     if (g_have_placement) {
         g_loaded_placement.length = sizeof(WINDOWPLACEMENT);
         SetWindowPlacement(g_main, &g_loaded_placement);
     }
+    apply_dark_titlebar(g_main);
     layout(g_main);
     ShowWindow(g_main, g_have_placement ? (int)g_loaded_placement.showCmd : show);
+    if (g_loaded_fs) toggle_fullscreen(g_main);
     SetTimer(g_main, 1, 250, nullptr);
     update_ui(g_main);
 
@@ -1461,6 +1697,9 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int show) {
 
     player_destroy(g_player);
     g_player = nullptr;
+    if (g_taskbar) g_taskbar->Release();
+    for (HICON ic : {g_ic_prev, g_ic_play, g_ic_pause, g_ic_next})
+        if (ic) DestroyIcon(ic);
     CoUninitialize();
     return 0;
 }

@@ -112,6 +112,8 @@ static void stop_pipeline(Player* p) {
     }
     p->vst = p->ast = p->sst = -1;
     p->rotation = 0;
+    p->stat_drops = 0;
+    p->hw_active = false;
     p->running = false;
     p->abort = false;
     p->eof = false;
@@ -228,6 +230,13 @@ void player_set_sub_delay(Player* p, double s) {
     p->redraw_req = true;  // repaint promptly while paused
 }
 double player_sub_delay(Player* p) { return p->sub_delay; }
+
+void player_set_sub_scale(Player* p, double s) {
+    if (p->vo) p->vo->set_sub_scale(s);
+    p->redraw_req = true;
+}
+
+double player_sub_scale(Player* p) { return p->vo ? p->vo->sub_scale() : 1.0; }
 
 void player_volume_step(Player* p, int steps) { p->ao.volume_step(steps); }
 void player_volume_set(Player* p, float v) { p->ao.volume_set(v); }
@@ -373,6 +382,29 @@ void player_show_osd(Player* p, const wchar_t* text, double seconds) {
         p->osd_until = av_gettime_relative() + (int64_t)(seconds * 1e6);
     }
     p->redraw_req = true;  // repaint promptly while paused
+}
+
+void player_set_picture(Player* p, int b, int c, int s, int h) {
+    if (p->vo) p->vo->set_picture(b, c, s, h);
+    p->redraw_req = true;
+}
+
+void player_get_picture(Player* p, int* b, int* c, int* s, int* h) {
+    if (p->vo) p->vo->get_picture(b, c, s, h);
+}
+
+void player_set_aspect(Player* p, int mode) {
+    if (p->vo) p->vo->set_aspect(mode);
+    p->redraw_req = true;
+}
+
+int player_aspect(Player* p) { return p->vo ? p->vo->aspect() : 0; }
+
+bool player_toggle_hud(Player* p) {
+    bool on = !p->hud;
+    p->hud = on;
+    p->redraw_req = true;
+    return on;
 }
 
 void player_notify_resize(Player* p) {
