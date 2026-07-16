@@ -135,7 +135,12 @@ engine linked in.
   `ReplaceFileW`, so the original survives any failure.
 - Runs `asInvoker` (never elevates), per-monitor-v2 DPI aware, heap corruption
   termination enabled, `/GS /guard:cf /DYNAMICBASE /NXCOMPAT` hardened build.
-- No network, no registry writes, no config files.
+- The gallery performs no network I/O: it only ever opens local file paths.
+  Image-only builds contain no network code at all. Video-enabled builds do
+  embed FFmpeg's network protocols (http/https/tcp/udp, TLS via Windows
+  Schannel) as part of the vendored engine — that code runs only if a caller
+  passes a URL, which the gallery never does.
+- No registry writes, no config files.
 
 ## Adding an image format
 
