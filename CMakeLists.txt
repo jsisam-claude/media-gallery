@@ -84,7 +84,7 @@ if(PHOTOGALLERY_VIDEO)
     target_include_directories(player_engine PUBLIC third_party/player-engine)
     target_link_libraries(player_engine
         PRIVATE ffmpeg
-        PUBLIC d3d11 dxgi d3dcompiler d2d1 dwrite ole32 avrt winmm user32
+        PUBLIC d3d11 dxgi d3dcompiler d2d1 dwrite windowscodecs ole32 avrt winmm user32
     )
 
     target_link_libraries(PhotoGallery PRIVATE player_engine)
