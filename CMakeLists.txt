@@ -80,7 +80,7 @@ if(PHOTOGALLERY_VIDEO)
         CXX_STANDARD_REQUIRED ON
     )
     target_compile_definitions(player_engine PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
-    target_compile_options(player_engine PRIVATE /W3 /utf-8)
+    target_compile_options(player_engine PRIVATE /W4 /utf-8)
     target_include_directories(player_engine PUBLIC third_party/player-engine)
     target_link_libraries(player_engine
         PRIVATE ffmpeg
@@ -101,10 +101,10 @@ if(PHOTOGALLERY_VIDEO)
         CXX_STANDARD_REQUIRED ON
     )
     target_compile_definitions(minimal-player PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
-    target_compile_options(minimal-player PRIVATE /W3 /utf-8)
+    target_compile_options(minimal-player PRIVATE /W4 /utf-8)
     target_link_libraries(minimal-player PRIVATE
         player_engine
-        shell32 gdi32 comctl32 comdlg32 shlwapi
+        shell32 gdi32 comctl32 comdlg32 shlwapi dwmapi
     )
 else()
     target_sources(PhotoGallery PRIVATE src/player_stub.cpp)
