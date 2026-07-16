@@ -604,6 +604,10 @@ void ToggleGrid() {
     if (g.gridMode) {
         g.gridSel = (std::max)(0, g.cur);
         GridEnsureVisible();
+        // The hidden video child shouldn't keep playing audio under the
+        // grid; no auto-resume on leaving — the user resumes manually.
+        if (g.videoMode && g.player && !player_is_paused(g.player))
+            player_toggle_pause(g.player);
     }
     PositionVideoWindow(); // grid paints the whole client; hide the video child
     InvalidateRect(g.hwnd, nullptr, FALSE);
