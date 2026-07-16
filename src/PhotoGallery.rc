@@ -25,6 +25,14 @@ BEGIN
         MENUITEM "Film&strip\tT",               IDM_FILMSTRIP
         MENUITEM "Thumbnail &Grid\tG",          IDM_GRID
         MENUITEM "Slidesho&w\tF5",              IDM_SLIDESHOW
+        POPUP "Slideshow &Options"
+        BEGIN
+            MENUITEM "&2 Seconds per Image",    IDM_SS_2S
+            MENUITEM "&5 Seconds per Image",    IDM_SS_5S
+            MENUITEM "&10 Seconds per Image",   IDM_SS_10S
+            MENUITEM SEPARATOR
+            MENUITEM "S&huffle",                IDM_SS_SHUFFLE
+        END
         MENUITEM SEPARATOR
         MENUITEM "Zoom &In\tCtrl++",            IDM_ZOOMIN
         MENUITEM "Zoom &Out\tCtrl+-",           IDM_ZOOMOUT

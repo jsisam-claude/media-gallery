@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <string>
@@ -41,7 +42,7 @@ constexpr double kMinZoom = 0.05, kMaxZoom = 16.0;
 constexpr UINT_PTR kTimerHq = 1;
 constexpr UINT_PTR kTimerVideo = 2; // transport-bar refresh while a video plays
 constexpr UINT_PTR kTimerSlideshow = 3;
-constexpr UINT kSlideshowMs = 5000; // per-image dwell; videos play to their end
+constexpr UINT kSlideshowMs = 5000; // default per-image dwell (View > Slideshow Options)
 constexpr int kVideoBarH = 34;      // transport bar height, pre-DPI-scale
 
 // ---------------------------------------------------------------- decode worker
@@ -360,7 +361,9 @@ struct App {
     bool showDetails = false;
     bool showFilmstrip = true;
 
-    bool slideshow = false; // F5 auto-advance; Esc/F5 exits
+    bool slideshow = false;          // F5 auto-advance; Esc/F5 exits
+    UINT slideshowMs = kSlideshowMs; // per-image dwell; videos play to their end
+    bool slideshowShuffle = false;   // advance to a random other item instead
 
     bool gridMode = false; // full-window thumbnail grid
     int gridCols = 8;      // 16..1, halves/doubles on zoom
@@ -1119,7 +1122,20 @@ void VideoSeekBy(double seconds) {
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 
-// F5: images advance every kSlideshowMs; a video plays to its end and the
+// The slideshow's step: the next item, or with shuffle on a random *other*
+// item — draw from the n-1 non-current slots so it never repeats in place.
+void SlideshowAdvance() {
+    const int n = (int)g.files.size();
+    if (g.slideshowShuffle && n > 1) {
+        int idx = rand() % (n - 1);
+        if (idx >= g.cur) ++idx;
+        NavigateTo(idx, true); // fwd decl has no default arg yet
+    } else {
+        NavigateTo(g.cur + 1, true);
+    }
+}
+
+// F5: images advance every g.slideshowMs; a video plays to its end and the
 // ENDED event advances instead (LoadCurrent swaps the timer accordingly).
 void ToggleSlideshow() {
     if (g.slideshow) {
@@ -1134,7 +1150,7 @@ void ToggleSlideshow() {
         // Never through the grid's pause path: a paused/finished video resumes.
         if (g.player && (player_is_paused(g.player) || g.videoEnded)) VideoPlayPause();
     } else {
-        SetTimer(g.hwnd, kTimerSlideshow, kSlideshowMs, nullptr);
+        SetTimer(g.hwnd, kTimerSlideshow, g.slideshowMs, nullptr);
     }
     UpdateTitle();
 }
@@ -1205,7 +1221,7 @@ void LoadCurrent() {
     if (g.slideshow) {
         if (g.cur < 0) StopSlideshow();
         else if (g.videoMode) KillTimer(g.hwnd, kTimerSlideshow); // ENDED advances
-        else SetTimer(g.hwnd, kTimerSlideshow, kSlideshowMs, nullptr);
+        else SetTimer(g.hwnd, kTimerSlideshow, g.slideshowMs, nullptr);
     }
     PositionVideoWindow();
     UpdateTitle();
@@ -1573,7 +1589,8 @@ void OnPlayerMessage(WPARAM evt, LPARAM gen) {
         case PLAYER_EVT_ENDED:
             g.videoEnded = true;
             if ((g.videoAdvance || g.slideshow) && g.files.size() > 1) {
-                NavigateTo(g.cur + 1); // auto-advance (opt-in) or slideshow
+                if (g.slideshow) SlideshowAdvance(); // shuffle-aware
+                else NavigateTo(g.cur + 1);          // auto-advance (opt-in)
                 return;
             }
             break;
@@ -1703,6 +1720,18 @@ void OnCommand(WORD id) {
             g.videoAdvance = !g.videoAdvance;
             break;
         case IDM_SLIDESHOW: ToggleSlideshow(); break;
+        case IDM_SS_2S:
+        case IDM_SS_5S:
+        case IDM_SS_10S:
+            g.slideshowMs = (id == IDM_SS_2S) ? 2000
+                          : (id == IDM_SS_10S) ? 10000 : 5000;
+            // Re-arm a running image slideshow at the new pace right away.
+            if (g.slideshow && !g.gridMode && !g.videoMode)
+                SetTimer(g.hwnd, kTimerSlideshow, g.slideshowMs, nullptr);
+            break;
+        case IDM_SS_SHUFFLE:
+            g.slideshowShuffle = !g.slideshowShuffle;
+            break;
         default: break;
     }
 }
@@ -1734,6 +1763,11 @@ void OnInitMenuPopup(HMENU menu) {
     enable(IDM_SLIDESHOW, haveAny);
     CheckMenuItem(menu, IDM_SLIDESHOW,
                   MF_BYCOMMAND | (g.slideshow ? MF_CHECKED : MF_UNCHECKED));
+    const UINT dwell = (g.slideshowMs == 2000) ? IDM_SS_2S
+                     : (g.slideshowMs == 10000) ? IDM_SS_10S : IDM_SS_5S;
+    CheckMenuRadioItem(menu, IDM_SS_2S, IDM_SS_10S, dwell, MF_BYCOMMAND);
+    CheckMenuItem(menu, IDM_SS_SHUFFLE,
+                  MF_BYCOMMAND | (g.slideshowShuffle ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_VIDEO_ADVANCE,
                   MF_BYCOMMAND | (g.videoAdvance ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_DETAILS,
@@ -1893,7 +1927,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else if (wParam == kTimerVideo && g.videoMode) {
                 InvalidateRect(hwnd, nullptr, FALSE); // transport bar progress
             } else if (wParam == kTimerSlideshow) {
-                if (g.slideshow && !g.gridMode && !g.videoMode) NavigateTo(g.cur + 1);
+                if (g.slideshow && !g.gridMode && !g.videoMode) SlideshowAdvance();
             }
             return 0;
         case WM_DROPFILES:
@@ -1987,6 +2021,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     HeapSetInformation(nullptr, HeapEnableTerminationOnCorruption, nullptr, 0);
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)))
         return 1;
+    srand(GetTickCount()); // slideshow shuffle order varies run to run
     InitDecoders();
 
     WNDCLASSEXW wc{};
