@@ -88,6 +88,24 @@ if(PHOTOGALLERY_VIDEO)
     )
 
     target_link_libraries(PhotoGallery PRIVATE player_engine)
+
+    # The standalone player, built from its vendored Win32 shell against the
+    # same engine — one branch, one build, both apps.
+    add_executable(minimal-player WIN32
+        third_party/player-shell/main.cpp
+        third_party/player-shell/version.rc
+        third_party/player-shell/app.manifest
+    )
+    set_target_properties(minimal-player PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+    )
+    target_compile_definitions(minimal-player PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(minimal-player PRIVATE /W3 /utf-8)
+    target_link_libraries(minimal-player PRIVATE
+        player_engine
+        shell32 gdi32 comctl32 comdlg32 shlwapi
+    )
 else()
     target_sources(PhotoGallery PRIVATE src/player_stub.cpp)
     target_include_directories(PhotoGallery PRIVATE third_party/player-engine)

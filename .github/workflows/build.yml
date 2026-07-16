@@ -26,3 +26,9 @@ jobs:
         with:
           name: photo-gallery-win64
           path: build/x64-release/PhotoGallery.exe
+
+      - name: Upload standalone player exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: minimal-player-win64
+          path: build/x64-release/minimal-player.exe

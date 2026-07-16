@@ -89,10 +89,13 @@ targets x86 and the link fails):
     cmake --preset x64-release
     cmake --build --preset x64-release
 
-Output: `build\x64-release\PhotoGallery.exe`. The first build compiles
+Output: `build\x64-release\PhotoGallery.exe` **and**
+`build\x64-release\minimal-player.exe` — this one branch builds both the
+gallery and the standalone player (same engine, the player's Win32 shell
+is vendored under `third_party/player-shell/`). The first build compiles
 the vendored FFmpeg sources (a few minutes, once). In the VS IDE, use
 *File → Open → Folder* on the repo — it picks up the presets. This is
-what CI builds and uploads as an artifact on every push.
+what CI builds and uploads as artifacts on every push.
 
 **Image-only routes** (no video, identical to the pre-video viewer):
 

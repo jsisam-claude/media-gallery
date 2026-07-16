@@ -72,7 +72,10 @@ step rejects the default x86 developer prompt):
     cmake --preset x64-release
     cmake --build --preset x64-release
 
-Output: `build\x64-release\PhotoGallery.exe`. Alternatively use
+Output: `build\x64-release\PhotoGallery.exe` and, from the same build,
+`build\x64-release\minimal-player.exe` — the standalone player compiled
+from its vendored shell (`third_party/player-shell/`) against the same
+engine, so this one branch yields both apps. Alternatively use
 *File → Open → Folder* in Visual Studio, or the classic generator:
 
     cmake -B build -G "Visual Studio 17 2022" -A x64
