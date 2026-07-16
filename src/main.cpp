@@ -40,6 +40,8 @@ constexpr COLORREF kAccent = RGB(0, 120, 215);
 constexpr double kMinZoom = 0.05, kMaxZoom = 16.0;
 constexpr UINT_PTR kTimerHq = 1;
 constexpr UINT_PTR kTimerVideo = 2; // transport-bar refresh while a video plays
+constexpr UINT_PTR kTimerSlideshow = 3;
+constexpr UINT kSlideshowMs = 5000; // per-image dwell; videos play to their end
 constexpr int kVideoBarH = 34;      // transport bar height, pre-DPI-scale
 
 // ---------------------------------------------------------------- decode worker
@@ -358,6 +360,8 @@ struct App {
     bool showDetails = false;
     bool showFilmstrip = true;
 
+    bool slideshow = false; // F5 auto-advance; Esc/F5 exits
+
     bool gridMode = false; // full-window thumbnail grid
     int gridCols = 8;      // 16..1, halves/doubles on zoom
     int gridScroll = 0;    // vertical scroll, pixels
@@ -556,6 +560,7 @@ int Scaled(int v) { return MulDiv(v, g.dpi, 96); }
 RECT ClientRect(); // fwd decls (defined below)
 void DrawCenteredText(HDC dc, const RECT& rc, const wchar_t* text);
 void PositionVideoWindow();
+void StopSlideshow();
 
 struct GridLayout {
     int cols = 1, cell = 1, rows = 0, contentH = 0;
@@ -602,6 +607,7 @@ void GridEnsureVisible() {
 void ToggleGrid() {
     g.gridMode = !g.gridMode;
     if (g.gridMode) {
+        StopSlideshow(); // the grid pauses video below; a slideshow ends instead
         g.gridSel = (std::max)(0, g.cur);
         GridEnsureVisible();
         // The hidden video child shouldn't keep playing audio under the
@@ -1045,11 +1051,19 @@ void UpdateTitle() {
         t = PathFindFileNameW(g.files[g.cur].c_str());
         if (g.rot != 0) t += L"*";
         t += L" (" + std::to_wstring(g.cur + 1) + L"/" + std::to_wstring(g.files.size()) + L")";
+        if (g.slideshow) t += L" — Slideshow (Esc to exit)";
         t += L" — Photo Gallery";
     } else {
         t = L"Photo Gallery";
     }
     SetWindowTextW(g.hwnd, t.c_str());
+}
+
+void StopSlideshow() {
+    if (!g.slideshow) return;
+    g.slideshow = false;
+    KillTimer(g.hwnd, kTimerSlideshow);
+    UpdateTitle();
 }
 
 // Show/hide the video child and fit it to the image area, leaving the
@@ -1103,6 +1117,26 @@ void VideoSeekBy(double seconds) {
     player_seek_rel(g.player, seconds);
     g.videoEnded = false;
     InvalidateRect(g.hwnd, nullptr, FALSE);
+}
+
+// F5: images advance every kSlideshowMs; a video plays to its end and the
+// ENDED event advances instead (LoadCurrent swaps the timer accordingly).
+void ToggleSlideshow() {
+    if (g.slideshow) {
+        StopSlideshow();
+        return;
+    }
+    if (g.files.empty()) return;
+    g.slideshow = true;
+    if (g.gridMode) {
+        OpenFromGrid(g.gridSel); // straight to the viewer; LoadCurrent arms us
+    } else if (g.videoMode) {
+        // Never through the grid's pause path: a paused/finished video resumes.
+        if (g.player && (player_is_paused(g.player) || g.videoEnded)) VideoPlayPause();
+    } else {
+        SetTimer(g.hwnd, kTimerSlideshow, kSlideshowMs, nullptr);
+    }
+    UpdateTitle();
 }
 
 void PrefetchNeighbors() {
@@ -1167,6 +1201,11 @@ void LoadCurrent() {
             g.worker.RequestCurrent(path, g.page);
         }
         g.strip.SetCurrent(g.cur);
+    }
+    if (g.slideshow) {
+        if (g.cur < 0) StopSlideshow();
+        else if (g.videoMode) KillTimer(g.hwnd, kTimerSlideshow); // ENDED advances
+        else SetTimer(g.hwnd, kTimerSlideshow, kSlideshowMs, nullptr);
     }
     PositionVideoWindow();
     UpdateTitle();
@@ -1533,8 +1572,8 @@ void OnPlayerMessage(WPARAM evt, LPARAM gen) {
             break; // duration/position are valid now; repaint below
         case PLAYER_EVT_ENDED:
             g.videoEnded = true;
-            if (g.videoAdvance && g.files.size() > 1) {
-                NavigateTo(g.cur + 1); // slideshow-style advance (opt-in)
+            if ((g.videoAdvance || g.slideshow) && g.files.size() > 1) {
+                NavigateTo(g.cur + 1); // auto-advance (opt-in) or slideshow
                 return;
             }
             break;
@@ -1595,7 +1634,8 @@ void OnCommand(WORD id) {
     switch (id) {
         case IDM_OPEN: OpenDialog(); break;
         case IDM_EXIT:
-            if (g.gridMode) ToggleGrid(); // Esc backs out of the grid first
+            if (g.slideshow) StopSlideshow(); // Esc backs out of the slideshow,
+            else if (g.gridMode) ToggleGrid(); // then the grid, before closing
             else PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
             break;
         case IDM_EDIT_PAINT: EditInPaint(g.gridMode ? g.gridSel : g.cur); break;
@@ -1662,6 +1702,7 @@ void OnCommand(WORD id) {
         case IDM_VIDEO_ADVANCE:
             g.videoAdvance = !g.videoAdvance;
             break;
+        case IDM_SLIDESHOW: ToggleSlideshow(); break;
         default: break;
     }
 }
@@ -1690,6 +1731,9 @@ void OnInitMenuPopup(HMENU menu) {
     enable(IDM_SEEK_FWD, video);
     enable(IDM_SEEK_BACK, video);
     enable(IDM_VIDEO_ADVANCE, g.player != nullptr);
+    enable(IDM_SLIDESHOW, haveAny);
+    CheckMenuItem(menu, IDM_SLIDESHOW,
+                  MF_BYCOMMAND | (g.slideshow ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_VIDEO_ADVANCE,
                   MF_BYCOMMAND | (g.videoAdvance ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_DETAILS,
@@ -1848,6 +1892,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 InvalidateRect(hwnd, nullptr, FALSE);
             } else if (wParam == kTimerVideo && g.videoMode) {
                 InvalidateRect(hwnd, nullptr, FALSE); // transport bar progress
+            } else if (wParam == kTimerSlideshow) {
+                if (g.slideshow && !g.gridMode && !g.videoMode) NavigateTo(g.cur + 1);
             }
             return 0;
         case WM_DROPFILES:

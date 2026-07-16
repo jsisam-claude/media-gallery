@@ -24,3 +24,4 @@
 #define IDM_SEEK_FWD        40019
 #define IDM_SEEK_BACK       40020
 #define IDM_VIDEO_ADVANCE   40021
+#define IDM_SLIDESHOW       40022

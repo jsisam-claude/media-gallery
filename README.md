@@ -36,6 +36,9 @@ Windows 10 and 11.
   2×2 → 1, bigger cells fetch sharper thumbnails), wheel scrolls, arrows move
   the selection, click or `Enter` opens the image, `Del` deletes the selected
   one, `Esc`/`G` returns to the viewer.
+- **Slideshow:** `F5` (or *View → Slideshow*) advances through the current
+  scope — the folder or a dropped selection — every 5 seconds; a video plays
+  to its end first, then moves on. `Esc` or `F5` exits.
 - **Zoom & pan:** mouse wheel zooms at the cursor, `Ctrl` `+`/`-` step zoom,
   `Ctrl+0` fit; drag to pan when zoomed in. Aspect ratio is always preserved;
   small images display at 100%, never stretched.
@@ -70,8 +73,9 @@ Windows 10 and 11.
 | `I` / `Alt+Enter` | Details pane |
 | `T` | Toggle filmstrip |
 | `G` | Thumbnail grid view (arrows select, `Enter`/click opens, `Ctrl` `+`/`-` or Ctrl+wheel changes density, `Esc` returns) |
+| `F5` | Slideshow (5 s per image; videos play to the end; `Esc`/`F5` exits) |
 | `Ctrl+O` | Open… |
-| `Esc` | Exit |
+| `Esc` | Exit (leaves the slideshow or grid first) |
 
 ## Building
 
