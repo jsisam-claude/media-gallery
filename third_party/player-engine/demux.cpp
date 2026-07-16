@@ -72,6 +72,15 @@ static AVCodecContext* open_decoder(AVFormatContext* fmt, int stream, int thread
 
 static bool open_input(Player* p) {
     std::string u8 = wide_to_utf8(p->path.c_str());
+    // Abort-aware I/O: without this, a dead network share or unplugged
+    // drive blocks avformat_open_input/av_read_frame indefinitely and
+    // player_close() hangs joining this thread.
+    p->fmt = avformat_alloc_context();
+    if (!p->fmt) return false;
+    p->fmt->interrupt_callback.callback = [](void* op) -> int {
+        return ((Player*)op)->abort ? 1 : 0;
+    };
+    p->fmt->interrupt_callback.opaque = p;
     int ret = avformat_open_input(&p->fmt, u8.c_str(), nullptr, nullptr);
     if (ret < 0) {
         char err[256];
@@ -167,6 +176,22 @@ static bool open_input(Player* p) {
     p->duration = p->fmt->duration > 0 ? p->fmt->duration / (double)AV_TIME_BASE : 0;
     p->start_time = p->fmt->start_time != AV_NOPTS_VALUE
                         ? p->fmt->start_time / (double)AV_TIME_BASE : 0;
+
+    // Chapter list for host menus; start times shifted to position space.
+    {
+        std::lock_guard<std::mutex> lk(p->tracks_m);
+        p->chapters.clear();
+        for (unsigned i = 0; i < p->fmt->nb_chapters; i++) {
+            AVChapter* ch = p->fmt->chapters[i];
+            double sec = ch->start * av_q2d(ch->time_base) - p->start_time;
+            if (sec < 0) sec = 0;
+            AVDictionaryEntry* t = av_dict_get(ch->metadata, "title", nullptr, 0);
+            std::wstring name = t && t->value[0]
+                                    ? utf8_to_wide(t->value)
+                                    : L"Chapter " + std::to_wstring(i + 1);
+            p->chapters.emplace_back(sec, std::move(name));
+        }
+    }
     log_line("demux: opened '%s' v=%d a=%d s=%d dur=%.1fs",
              u8.c_str(), p->vst, p->ast, p->sst, p->duration);
     return true;
