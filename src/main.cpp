@@ -855,6 +855,17 @@ std::vector<std::pair<std::wstring, std::wstring>> BuildDetails() {
     return rows;
 }
 
+// Details panel rectangle in client coordinates — shared by Paint (which
+// draws it) and PositionVideoWindow (which punches it out of the video
+// child's window region so the drawing shows through).
+RECT DetailsPanelRect(const RECT& imgArea, size_t rows) {
+    const int pad = Scaled(12);
+    RECT panel = {imgArea.left + Scaled(12), imgArea.top + Scaled(12), 0, 0};
+    panel.right = panel.left + Scaled(380);
+    panel.bottom = panel.top + 2 * pad + (int)rows * Scaled(20);
+    return panel;
+}
+
 void Paint(HDC dcWin, const RECT& client) {
     EnsureFonts();
     const int cw = client.right, ch = client.bottom;
@@ -985,10 +996,7 @@ void Paint(HDC dcWin, const RECT& client) {
     if (g.showDetails && g.cur >= 0) {
         auto rows = BuildDetails();
         const int pad = Scaled(12), lineH = Scaled(20), labelW = Scaled(100);
-        const int panelW = Scaled(380);
-        RECT panel = {L.imgArea.left + Scaled(12), L.imgArea.top + Scaled(12), 0, 0};
-        panel.right = panel.left + panelW;
-        panel.bottom = panel.top + 2 * pad + (int)rows.size() * lineH;
+        RECT panel = DetailsPanelRect(L.imgArea, rows.size());
         HBRUSH pb = CreateSolidBrush(kPanelBg);
         FillRect(dc, &panel, pb);
         DeleteObject(pb);
@@ -1041,27 +1049,36 @@ void UpdateTitle() {
 }
 
 // Show/hide the video child and fit it to the image area, leaving the
-// transport strip at the bottom for the parent to draw into. Call wherever
-// the layout inputs change (size, DPI, filmstrip/grid toggles, navigation).
+// transport strip at the bottom for the parent to draw into. When the
+// details panel is open, its rectangle is punched out of the child's
+// window region so the parent's panel pixels show through
+// (WS_CLIPCHILDREN blocks drawing over the child). Call wherever the
+// layout inputs change (size, DPI, filmstrip/grid/panel toggles,
+// navigation, probe arrival).
 void PositionVideoWindow() {
     if (!g.videoWnd) return;
     if (!g.videoMode || g.gridMode) {
+        SetWindowRgn(g.videoWnd, nullptr, TRUE);
         ShowWindow(g.videoWnd, SW_HIDE);
         return;
     }
     RECT rc = ClientRect();
     Layout L = ComputeLayout(rc);
     RECT v = L.imgArea;
-    if (g.showDetails && g.cur >= 0) {
-        // The parent can't draw the details panel over the child
-        // (WS_CLIPCHILDREN), so leave a band for it. Mirrors the panel
-        // metrics in Paint(): 12px margin + 12px padding + 20px rows.
-        v.top += Scaled(12) + 2 * Scaled(12) +
-                 (int)BuildDetails().size() * Scaled(20) + Scaled(8);
-    }
     v.bottom = (std::max)(v.top + 1, v.bottom - Scaled(kVideoBarH));
     SetWindowPos(g.videoWnd, nullptr, v.left, v.top, v.right - v.left,
                  v.bottom - v.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (g.showDetails && g.cur >= 0) {
+        RECT panel = DetailsPanelRect(L.imgArea, BuildDetails().size());
+        OffsetRect(&panel, -v.left, -v.top); // child-relative coordinates
+        HRGN rgn = CreateRectRgn(0, 0, v.right - v.left, v.bottom - v.top);
+        HRGN hole = CreateRectRgn(panel.left, panel.top, panel.right, panel.bottom);
+        CombineRgn(rgn, rgn, hole, RGN_DIFF);
+        DeleteObject(hole);
+        SetWindowRgn(g.videoWnd, rgn, TRUE); // the system owns rgn from here
+    } else {
+        SetWindowRgn(g.videoWnd, nullptr, TRUE);
+    }
     if (g.player) player_notify_resize(g.player);
 }
 
@@ -1498,7 +1515,7 @@ void OnProbed(ProbeDone* d) {
     g.videoInfo = d->info;
     g.videoProbed = true;
     if (g.showDetails) {
-        PositionVideoWindow(); // the panel gained rows; move the child down
+        PositionVideoWindow(); // the panel gained rows; regrow the region hole
         InvalidateRect(g.hwnd, nullptr, FALSE);
     }
 }
@@ -1590,7 +1607,7 @@ void OnCommand(WORD id) {
             break;
         case IDM_DETAILS:
             g.showDetails = !g.showDetails;
-            PositionVideoWindow(); // the child leaves room for the panel
+            PositionVideoWindow(); // punch/clear the panel hole in the child
             InvalidateRect(g.hwnd, nullptr, FALSE);
             break;
         case IDM_FILMSTRIP:
