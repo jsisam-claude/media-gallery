@@ -28,7 +28,8 @@ Windows 10 and 11.
   `←`/`→` follow *that window's current sort order* (read live via
   `IShellWindows`/`IFolderView`); otherwise Explorer's default natural name
   sort (`StrCmpLogicalW`).
-- **Filmstrip:** thumbnail ribbon (Explorer's own thumbnail pipeline) along the
+- **Filmstrip:** thumbnail ribbon (Explorer's own thumbnail pipeline; in video
+  builds the engine decodes a real frame for video thumbnails) along the
   bottom; click a thumbnail to jump to it.
 - **Thumbnail grid:** `G` switches to a full-window grid of the whole folder —
   8 columns by default; `Ctrl` `+`/`-` or Ctrl+wheel zoom the grid (8×8 → 4×4 →

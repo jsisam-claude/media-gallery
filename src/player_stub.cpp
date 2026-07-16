@@ -43,3 +43,9 @@ bool player_probe(const wchar_t*, PlayerMediaInfo* info) {
     if (info) *info = PlayerMediaInfo{};
     return false;
 }
+
+bool player_extract_thumb(const wchar_t*, int, int, uint8_t*, int* out_w, int* out_h) {
+    if (out_w) *out_w = 0;
+    if (out_h) *out_h = 0;
+    return false;
+}

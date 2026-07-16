@@ -4,8 +4,11 @@
 #include <shobjidl.h>
 
 #include <algorithm>
+#include <cstring>
+#include <vector>
 
 #include "decoder.h"
+#include "player.h"
 
 namespace {
 
@@ -71,6 +74,34 @@ HBITMAP LoadShellThumb(const std::wstring& path, int px) {
     return hbmp;
 }
 
+// Real frame from the video engine (aspect-fit, so out dims may be smaller
+// than px on one axis). Null on failure — including the image-only stub,
+// whose player_extract_thumb always returns false — so callers fall back
+// to the shell thumbnail.
+HBITMAP ThumbFromVideo(const std::wstring& path, int px) {
+    std::vector<uint8_t> buf((size_t)px * px * 4);
+    int w = 0, h = 0;
+    if (!player_extract_thumb(path.c_str(), px, px, buf.data(), &w, &h) ||
+        w <= 0 || h <= 0)
+        return nullptr;
+
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    HDC screen = GetDC(nullptr);
+    void* bits = nullptr;
+    HBITMAP hbmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(nullptr, screen);
+    // Both sides are tightly packed BGRA (32-bpp DIB rows have no padding).
+    if (hbmp) memcpy(bits, buf.data(), (size_t)w * h * 4);
+    return hbmp;
+}
+
 } // namespace
 
 int Filmstrip::SizeClassFor(int cellPx) {
@@ -122,7 +153,8 @@ void Filmstrip::WorkerLoop() {
         queue_.pop_front();
         LeaveCriticalSection(&cs_);
 
-        HBITMAP hbmp = LoadShellThumb(path, px);
+        HBITMAP hbmp = IsVideoFile(path) ? ThumbFromVideo(path, px) : nullptr;
+        if (!hbmp) hbmp = LoadShellThumb(path, px);
         auto* r = new ThumbResult{std::move(path), px, hbmp};
         if (!PostMessageW(owner_, readyMsg_, 0, reinterpret_cast<LPARAM>(r))) {
             if (r->bmp) DeleteObject(r->bmp);
