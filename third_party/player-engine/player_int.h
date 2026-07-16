@@ -140,7 +140,10 @@ struct MMDevice;  // COM bits hidden in audio_out.cpp
 class AudioOut {
 public:
     // Pulls decoded frames from fq; compares frame serials against pq_serial.
-    bool start(FrameQueue* fq, const std::atomic<int>* pq_serial);
+    // drop_until (optional): frames wholly before this pts are discarded and
+    // the value reset to NAN once reached (exact-seek support).
+    bool start(FrameQueue* fq, const std::atomic<int>* pq_serial,
+               std::atomic<double>* drop_until = nullptr);
     void stop();
     void pause(bool paused);
     void flush();                 // seek: clear FIFO, clock invalid until next frame
@@ -150,17 +153,26 @@ public:
     float volume();
     void set_mute(bool m);
     bool muted();
+    // Endpoint id ("" = follow system default). Takes effect immediately
+    // when playing (device reopen) and on the next start otherwise.
+    void set_device(const wchar_t* id);
+    std::wstring device();
+    void set_speed(double s);     // resample ratio (pitch shifts with rate)
     ~AudioOut() { stop(); }
 
 private:
     void thread_main();
     bool run_device();            // one device lifetime; true = lost, retry
     MMDevice* dev_ = nullptr;
-    std::mutex dev_m_;            // guards dev_ vs. reopen on device loss
+    std::mutex dev_m_;            // guards dev_/want_dev_ vs. reopen
+    std::wstring want_dev_;       // endpoint id; empty = system default
+    std::atomic<bool> dev_change_{false};
+    std::atomic<double> speed_{1.0};
     std::atomic<float> want_vol_{-1.0f};  // last requested; reapplied on reopen
     std::atomic<int> want_mute_{-1};
     FrameQueue* fq_ = nullptr;
     const std::atomic<int>* pq_serial_ = nullptr;
+    std::atomic<double>* drop_until_ = nullptr;
     std::thread th_;
     std::atomic<bool> abort_{false}, paused_{false}, flush_req_{false};
     std::mutex clock_m_;
@@ -183,8 +195,9 @@ class VideoOut {
 public:
     bool init(HWND hwnd);
     // Renders a CPU frame (any sw pix fmt) or an AV_PIX_FMT_D3D11 decoder
-    // texture, plus subtitle/OSD overlays.
-    bool render(AVFrame* f, const SubRender& overlays);
+    // texture, plus subtitle/OSD overlays. rotation_deg (0/90/180/270,
+    // clockwise) comes from the stream's display matrix.
+    bool render(AVFrame* f, const SubRender& overlays, int rotation_deg = 0);
     void resize();
     void shutdown();
     // Device for D3D11VA decoding (shared with rendering so decoder output
@@ -219,6 +232,7 @@ struct Player {
     AVCodecContext* vctx = nullptr;
     AVCodecContext* actx = nullptr;
     AVCodecContext* sctx = nullptr;
+    std::atomic<int> rotation{0};     // display-matrix rotation, CW degrees
 
     PacketQueue vq, aq;
     std::atomic<int> vq_serial{0}, aq_serial{0}; // mirrors queue serials for consumers
@@ -238,6 +252,9 @@ struct Player {
     std::mutex seek_m;
     bool seek_req = false;
     double seek_to = 0;
+    // Exact seek: av_seek_frame lands on the prior keyframe; frames and
+    // audio before this pts (stream time) are decoded but dropped.
+    std::atomic<double> precise_v{NAN}, precise_a{NAN};
 
     // host event callback (fires on engine threads)
     PlayerEventFn evt_fn = nullptr;
@@ -265,6 +282,11 @@ struct Player {
     void fire(PlayerEvent evt) {
         if (evt_fn) evt_fn(evt_user, evt);
     }
+
+    // playback shaping
+    std::atomic<double> speed{1.0};       // 0.25..4
+    std::atomic<double> audio_delay{0};   // s; + = audio heard later
+    std::atomic<double> sub_delay{0};     // s; + = subtitles shown later
 
     // external clock fallback when there is no audio stream
     std::mutex extclk_m;

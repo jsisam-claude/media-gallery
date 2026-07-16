@@ -5,6 +5,30 @@
 #include <cmath>
 #include <mutex>
 #include <timeapi.h>
+#include <wincodec.h>
+
+extern "C" {
+#include <libavutil/display.h>
+}
+
+// Rotate packed BGRA clockwise by 0/90/180/270 into out; returns new dims.
+static void rotate_bgra(const uint32_t* in, int w, int h, int rot,
+                        std::vector<uint32_t>& out, int* ow_out, int* oh_out) {
+    int ow = (rot == 90 || rot == 270) ? h : w;
+    int oh = (rot == 90 || rot == 270) ? w : h;
+    out.resize((size_t)ow * oh);
+    for (int y = 0; y < oh; y++)
+        for (int x = 0; x < ow; x++) {
+            int sx, sy;
+            if (rot == 90) { sx = y; sy = h - 1 - x; }
+            else if (rot == 270) { sx = w - 1 - y; sy = x; }
+            else if (rot == 180) { sx = w - 1 - x; sy = h - 1 - y; }
+            else { sx = x; sy = y; }
+            out[(size_t)y * ow + x] = in[(size_t)sy * w + sx];
+        }
+    *ow_out = ow;
+    *oh_out = oh;
+}
 
 static void engine_av_log(void*, int level, const char* fmt, va_list args) {
     if (level > AV_LOG_WARNING) return;
@@ -24,12 +48,12 @@ static void engine_global_init() {
 double Player::master_clock() {
     if (ast >= 0) {
         double c = ao.clock();
-        if (!std::isnan(c)) return c;
+        if (!std::isnan(c)) return c + audio_delay;  // + = audio heard later
         return NAN;
     }
     std::lock_guard<std::mutex> lk(extclk_m);
     if (std::isnan(extclk_pts)) return NAN;
-    return extclk_pts + (av_gettime_relative() - extclk_time) / 1e6;
+    return extclk_pts + (av_gettime_relative() - extclk_time) / 1e6 * speed;
 }
 
 void Player::extclk_set(double pts) {
@@ -87,6 +111,7 @@ static void stop_pipeline(Player* p) {
         p->chapters.clear();
     }
     p->vst = p->ast = p->sst = -1;
+    p->rotation = 0;
     p->running = false;
     p->abort = false;
     p->eof = false;
@@ -98,6 +123,8 @@ static void stop_pipeline(Player* p) {
     }
     p->vclock = NAN;
     p->duration = 0;
+    p->precise_v = NAN;
+    p->precise_a = NAN;
     {
         std::lock_guard<std::mutex> lk(p->extclk_m);
         p->extclk_pts = NAN;
@@ -120,6 +147,8 @@ bool player_open(Player* p, const wchar_t* path) {
     p->sub_choice = 0;
     p->open_at = 0;
     p->paused = false;
+    p->audio_delay = 0;  // per-file corrections; speed persists
+    p->sub_delay = 0;
     return start_pipeline(p);
 }
 
@@ -176,6 +205,29 @@ void player_seek_to(Player* p, double seconds) {
 void player_seek_rel(Player* p, double seconds) {
     player_seek_to(p, player_position(p) + seconds);
 }
+
+void player_set_speed(Player* p, double s) {
+    if (s < 0.25) s = 0.25;
+    if (s > 4.0) s = 4.0;
+    if (p->ast < 0) {  // re-anchor the wall-clock fallback at the current pos
+        double cur = p->master_clock();
+        p->speed = s;
+        p->extclk_set(cur);
+    } else {
+        p->speed = s;
+    }
+    p->ao.set_speed(s);
+}
+
+double player_speed(Player* p) { return p->speed; }
+
+void player_set_audio_delay(Player* p, double s) { p->audio_delay = s; }
+double player_audio_delay(Player* p) { return p->audio_delay; }
+void player_set_sub_delay(Player* p, double s) {
+    p->sub_delay = s;
+    p->redraw_req = true;  // repaint promptly while paused
+}
+double player_sub_delay(Player* p) { return p->sub_delay; }
 
 void player_volume_step(Player* p, int steps) { p->ao.volume_step(steps); }
 void player_volume_set(Player* p, float v) { p->ao.volume_set(v); }
@@ -245,6 +297,17 @@ void player_select_sub_track(Player* p, int i) {
     int choice = (i < 0) ? n : i;  // n = the "off" slot
     if (choice > n || choice == p->sub_choice) return;
     reopen(p, p->want_audio_rel, choice);
+}
+
+void player_select_tracks(Player* p, int audio, int sub) {
+    if (!p->running) return;
+    int na = player_audio_track_count(p);
+    int ns = player_sub_track_count(p);
+    if (audio < 0 || audio >= na) audio = p->want_audio_rel;
+    int choice = (sub < 0) ? ns : sub;  // ns = the "off" slot
+    if (choice > ns) choice = p->sub_choice;
+    if (audio == p->want_audio_rel && choice == p->sub_choice) return;
+    reopen(p, audio, choice);
 }
 
 int player_chapter_count(Player* p) {
@@ -391,6 +454,12 @@ bool player_probe(const wchar_t* path, PlayerMediaInfo* info) {
 
 bool player_extract_thumb(const wchar_t* path, int max_w, int max_h,
                           uint8_t* buf, int* out_w, int* out_h) {
+    return player_extract_thumb_at(path, -1, max_w, max_h, buf, out_w, out_h);
+}
+
+bool player_extract_thumb_at(const wchar_t* path, double at_seconds,
+                             int max_w, int max_h,
+                             uint8_t* buf, int* out_w, int* out_h) {
     if (!buf || !out_w || !out_h || max_w < 8 || max_h < 8) return false;
     engine_global_init();
     std::string u8 = wide_to_utf8(path);
@@ -414,6 +483,18 @@ bool player_extract_thumb(const wchar_t* path, int max_w, int max_h,
 
         const AVCodec* dec = avcodec_find_decoder(fc->streams[vst]->codecpar->codec_id);
         if (!dec) break;
+
+        int rot = 0;  // display-matrix rotation, CW (phone recordings)
+        {
+            AVCodecParameters* par = fc->streams[vst]->codecpar;
+            const AVPacketSideData* sd = av_packet_side_data_get(
+                par->coded_side_data, par->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+            if (sd && sd->size >= 9 * sizeof(int32_t)) {
+                double a = av_display_rotation_get((const int32_t*)sd->data);
+                if (!std::isnan(a))
+                    rot = ((((int)lround(-a) % 360) + 360) % 360 + 45) / 90 * 90 % 360;
+            }
+        }
         ctx = avcodec_alloc_context3(dec);
         if (!ctx || avcodec_parameters_to_context(ctx, fc->streams[vst]->codecpar) < 0)
             break;
@@ -422,7 +503,10 @@ bool player_extract_thumb(const wchar_t* path, int max_w, int max_h,
 
         // A few seconds in beats the (often black/logo) very first frame.
         double dur = fc->duration > 0 ? fc->duration / (double)AV_TIME_BASE : 0;
-        double at = dur > 3 ? std::fmin(dur * 0.10, 60.0) : 0;
+        double at = at_seconds;
+        if (at < 0) at = dur > 3 ? std::fmin(dur * 0.10, 60.0) : 0;
+        if (dur > 0.5 && at > dur - 0.5) at = dur - 0.5;
+        if (at < 0) at = 0;
         if (at > 0) {
             int64_t ts = fc->start_time != AV_NOPTS_VALUE
                              ? fc->start_time + (int64_t)(at * AV_TIME_BASE)
@@ -449,7 +533,11 @@ bool player_extract_thumb(const wchar_t* path, int max_w, int max_h,
         if (frame->sample_aspect_ratio.num > 0 && frame->sample_aspect_ratio.den > 0)
             sw = (int)av_rescale(sw, frame->sample_aspect_ratio.num,
                                  frame->sample_aspect_ratio.den);
-        double scale = std::fmin((double)max_w / sw, (double)max_h / sh);
+        // Scale to fit the caller box in *display* orientation: for 90/270
+        // the pre-rotation image fits the swapped box, then pixels rotate.
+        int box_w = (rot == 90 || rot == 270) ? max_h : max_w;
+        int box_h = (rot == 90 || rot == 270) ? max_w : max_h;
+        double scale = std::fmin((double)box_w / sw, (double)box_h / sh);
         if (scale > 1.0) scale = 1.0;
         int tw = (int)(sw * scale + 0.5), th = (int)(sh * scale + 0.5);
         if (tw < 1) tw = 1;
@@ -459,11 +547,24 @@ bool player_extract_thumb(const wchar_t* path, int max_w, int max_h,
                              tw, th, AV_PIX_FMT_BGRA, SWS_BILINEAR,
                              nullptr, nullptr, nullptr);
         if (!sws) break;
-        uint8_t* dst[1] = {buf};
+        std::vector<uint8_t> tmp;
+        uint8_t* target = buf;
+        if (rot) {
+            tmp.resize((size_t)tw * th * 4);
+            target = tmp.data();
+        }
+        uint8_t* dst[1] = {target};
         int dst_stride[1] = {tw * 4};
         sws_scale(sws, frame->data, frame->linesize, 0, frame->height, dst, dst_stride);
-        *out_w = tw;
-        *out_h = th;
+
+        if (rot) {
+            std::vector<uint32_t> r;
+            rotate_bgra((const uint32_t*)tmp.data(), tw, th, rot, r, out_w, out_h);
+            memcpy(buf, r.data(), r.size() * 4);
+        } else {
+            *out_w = tw;
+            *out_h = th;
+        }
         ok = true;
     } while (false);
 
@@ -472,5 +573,98 @@ bool player_extract_thumb(const wchar_t* path, int max_w, int max_h,
     av_frame_free(&frame);
     avcodec_free_context(&ctx);
     avformat_close_input(&fc);
+    return ok;
+}
+
+// ------------------------------------------------------------- snapshot
+
+static bool write_png_wic(const wchar_t* path, const uint32_t* px, int w, int h) {
+    IWICImagingFactory* fac = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fac))))
+        return false;
+    IWICStream* st = nullptr;
+    IWICBitmapEncoder* enc = nullptr;
+    IWICBitmapFrameEncode* fr = nullptr;
+    IPropertyBag2* props = nullptr;
+    bool ok = false;
+    do {
+        if (FAILED(fac->CreateStream(&st))) break;
+        if (FAILED(st->InitializeFromFilename(path, GENERIC_WRITE))) break;
+        if (FAILED(fac->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc))) break;
+        if (FAILED(enc->Initialize(st, WICBitmapEncoderNoCache))) break;
+        if (FAILED(enc->CreateNewFrame(&fr, &props))) break;
+        if (FAILED(fr->Initialize(props))) break;
+        if (FAILED(fr->SetSize(w, h))) break;
+        WICPixelFormatGUID pf = GUID_WICPixelFormat32bppBGRA;
+        if (FAILED(fr->SetPixelFormat(&pf))) break;
+        if (!IsEqualGUID(pf, GUID_WICPixelFormat32bppBGRA)) break;
+        if (FAILED(fr->WritePixels(h, (UINT)w * 4, (UINT)w * h * 4,
+                                   (BYTE*)px))) break;
+        if (FAILED(fr->Commit())) break;
+        if (FAILED(enc->Commit())) break;
+        ok = true;
+    } while (false);
+    if (props) props->Release();
+    if (fr) fr->Release();
+    if (enc) enc->Release();
+    if (st) st->Release();
+    fac->Release();
+    return ok;
+}
+
+bool player_snapshot(Player* p, const wchar_t* png_path) {
+    AVFrame* src = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(p->lastf_m);
+        if (p->last_frame) src = av_frame_clone(p->last_frame);
+    }
+    if (!src) return false;
+
+    AVFrame* sw = src;
+    AVFrame* xfer = nullptr;
+    if (src->format == AV_PIX_FMT_D3D11) {  // download the decoder texture
+        xfer = av_frame_alloc();
+        if (!xfer || av_hwframe_transfer_data(xfer, src, 0) < 0) {
+            av_frame_free(&xfer);
+            av_frame_free(&src);
+            return false;
+        }
+        sw = xfer;
+    }
+
+    bool ok = false;
+    int w = sw->width, h = sw->height;
+    int dw = w;
+    if (sw->sample_aspect_ratio.num > 0 && sw->sample_aspect_ratio.den > 0)
+        dw = (int)av_rescale(w, sw->sample_aspect_ratio.num,
+                             sw->sample_aspect_ratio.den);
+    SwsContext* sc = nullptr;
+    if (w > 0 && h > 0 && dw > 0) {
+        std::vector<uint32_t> bgra((size_t)dw * h);
+        sc = sws_getContext(w, h, (AVPixelFormat)sw->format, dw, h,
+                            AV_PIX_FMT_BGRA, SWS_BICUBIC, nullptr, nullptr, nullptr);
+        if (sc) {
+            uint8_t* dst[1] = {(uint8_t*)bgra.data()};
+            int stride[1] = {dw * 4};
+            sws_scale(sc, sw->data, sw->linesize, 0, h, dst, stride);
+            // sws leaves alpha at 0 for some paths; PNG wants opaque
+            for (auto& c : bgra) c |= 0xFF000000u;
+
+            int rot = p->rotation;
+            if (rot) {
+                std::vector<uint32_t> r;
+                int ow = 0, oh = 0;
+                rotate_bgra(bgra.data(), dw, h, rot, r, &ow, &oh);
+                ok = write_png_wic(png_path, r.data(), ow, oh);
+            } else {
+                ok = write_png_wic(png_path, bgra.data(), dw, h);
+            }
+        }
+    }
+    sws_freeContext(sc);
+    av_frame_free(&xfer);
+    av_frame_free(&src);
+    if (ok) log_line("snapshot: wrote %ls", png_path);
     return ok;
 }

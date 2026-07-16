@@ -36,6 +36,25 @@ float player_volume(Player* p);
 void player_set_mute(Player* p, bool mute);
 bool player_is_muted(Player* p);
 
+// Playback speed 0.25..4 (audio pitch shifts with rate). Persists across
+// files within the session.
+void player_set_speed(Player* p, double s);
+double player_speed(Player* p);
+// Sync corrections in seconds, reset on every open. Positive audio delay
+// = audio heard later; positive subtitle delay = subtitles shown later.
+void player_set_audio_delay(Player* p, double s);
+double player_audio_delay(Player* p);
+void player_set_sub_delay(Player* p, double s);
+double player_sub_delay(Player* p);
+
+// Audio output endpoints. Enumeration is standalone (COM-initialized
+// thread); selection by endpoint id, NULL = follow the system default.
+int player_audio_device_count(void);
+void player_audio_device_name(int i, wchar_t* buf, size_t buflen);
+void player_audio_device_id(int i, wchar_t* buf, size_t buflen);
+void player_set_audio_device(Player* p, const wchar_t* id);
+void player_audio_device_current(Player* p, wchar_t* buf, size_t buflen);
+
 // Both return the number of the now-active track (1-based) or 0 if none.
 int player_cycle_audio(Player* p);
 int player_cycle_subtitle(Player* p);
@@ -51,6 +70,8 @@ int player_sub_track_count(Player* p);
 int player_sub_track_current(Player* p);  // -1 = off
 void player_sub_track_name(Player* p, int i, wchar_t* buf, size_t buflen);
 void player_select_sub_track(Player* p, int i);  // -1 = off
+// Select both at once (one reopen); pass current values to leave unchanged.
+void player_select_tracks(Player* p, int audio, int sub);
 
 // Chapters (mkv/mp4). Count is 0 when the media has none.
 int player_chapter_count(Player* p);
@@ -59,6 +80,10 @@ void player_chapter_name(Player* p, int i, wchar_t* buf, size_t buflen);
 int player_chapter_current(Player* p);          // index, -1 when none
 void player_chapter_go(Player* p, int i);       // seek to chapter i
 int player_chapter_seek(Player* p, int delta);  // jump +-N; returns target or -1
+
+// Saves the currently displayed frame as a PNG (synchronous, WIC encoder;
+// call from a COM-initialized thread). Applies aspect ratio and rotation.
+bool player_snapshot(Player* p, const wchar_t* png_path);
 
 // Transient on-screen text (volume, seek feedback...), auto-expires.
 void player_show_osd(Player* p, const wchar_t* text, double seconds);
@@ -91,3 +116,8 @@ bool player_probe(const wchar_t* path, PlayerMediaInfo* info);
 // instance needed - safe to call from a host's thumbnail worker thread.
 bool player_extract_thumb(const wchar_t* path, int max_w, int max_h,
                           uint8_t* buf, int* out_w, int* out_h);
+// Same, at an explicit position (seconds, clamped to the duration).
+// at_seconds < 0 picks the representative default.
+bool player_extract_thumb_at(const wchar_t* path, double at_seconds,
+                             int max_w, int max_h,
+                             uint8_t* buf, int* out_w, int* out_h);

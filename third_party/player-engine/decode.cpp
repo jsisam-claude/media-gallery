@@ -69,10 +69,10 @@ void video_render_thread(Player* p) {
                         SubRender ov;
                         ov.osd = p->osd_now();
                         if (!std::isnan(pts)) {
-                            ov.text = p->subs.active_at(pts);
-                            p->subs.active_bitmaps_at(pts, ov.bitmaps);
+                            ov.text = p->subs.active_at(pts - p->sub_delay);
+                            p->subs.active_bitmaps_at(pts - p->sub_delay, ov.bitmaps);
                         }
-                        p->vo->render(fr.f, ov);
+                        p->vo->render(fr.f, ov, p->rotation);
                         if (!std::isnan(pts)) {
                             p->vclock.store(pts);
                             p->extclk_set(pts);
@@ -92,10 +92,10 @@ void video_render_thread(Player* p) {
                     SubRender ov;
                     ov.osd = p->osd_now();
                     if (!std::isnan(lp)) {
-                        ov.text = p->subs.active_at(lp);
-                        p->subs.active_bitmaps_at(lp, ov.bitmaps);
+                        ov.text = p->subs.active_at(lp - p->sub_delay);
+                        p->subs.active_bitmaps_at(lp - p->sub_delay, ov.bitmaps);
                     }
-                    p->vo->render(p->last_frame, ov);
+                    p->vo->render(p->last_frame, ov, p->rotation);
                 }
             }
             Sleep(20);
@@ -108,6 +108,18 @@ void video_render_thread(Player* p) {
             av_frame_free(&fr.f);
             first_frame = true;
             continue;
+        }
+
+        // Exact seek: drop decoded frames between the keyframe we landed on
+        // and the requested position.
+        double pv = p->precise_v.load();
+        if (!std::isnan(pv)) {
+            if (!std::isnan(fr.pts) &&
+                fr.pts + (fr.dur > 0 ? fr.dur : 0.040) <= pv) {
+                av_frame_free(&fr.f);
+                continue;
+            }
+            p->precise_v = NAN;
         }
 
         double pts = fr.pts;
@@ -141,10 +153,10 @@ void video_render_thread(Player* p) {
         SubRender ov;
         ov.osd = p->osd_now();
         if (!std::isnan(pts)) {
-            ov.text = p->subs.active_at(pts);
-            p->subs.active_bitmaps_at(pts, ov.bitmaps);
+            ov.text = p->subs.active_at(pts - p->sub_delay);
+            p->subs.active_bitmaps_at(pts - p->sub_delay, ov.bitmaps);
         }
-        p->vo->render(fr.f, ov);
+        p->vo->render(fr.f, ov, p->rotation);
         if (!std::isnan(pts)) p->vclock.store(pts);
         {
             std::lock_guard<std::mutex> lk(p->lastf_m);

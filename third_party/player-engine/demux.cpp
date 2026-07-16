@@ -4,6 +4,7 @@
 
 #include <d3d11.h>
 extern "C" {
+#include <libavutil/display.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
 }
@@ -155,6 +156,25 @@ static bool open_input(Player* p) {
         for (int idx : p->sub_streams) p->sub_names.push_back(stream_label(idx, n++));
     }
 
+    // Phone recordings store their orientation as a display matrix; the
+    // renderer applies it so portrait videos play upright.
+    if (p->vst >= 0) {
+        AVCodecParameters* vp = p->fmt->streams[p->vst]->codecpar;
+        const AVPacketSideData* sd = av_packet_side_data_get(
+            vp->coded_side_data, vp->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+        int rot = 0;
+        if (sd && sd->size >= 9 * sizeof(int32_t)) {
+            double a = av_display_rotation_get((const int32_t*)sd->data);
+            if (!std::isnan(a)) {
+                rot = (int)lround(-a);          // matrix angle is CCW; we rotate CW
+                rot = ((rot % 360) + 360) % 360;
+                rot = ((rot + 45) / 90 * 90) % 360;  // snap to 90-degree steps
+            }
+        }
+        p->rotation = rot;
+        if (rot) log_line("demux: video is rotated %d degrees", rot);
+    }
+
     if (p->vst >= 0) p->fmt->streams[p->vst]->discard = AVDISCARD_DEFAULT;
     if (p->ast >= 0) p->fmt->streams[p->ast]->discard = AVDISCARD_DEFAULT;
     if (p->sst >= 0) p->fmt->streams[p->sst]->discard = AVDISCARD_DEFAULT;
@@ -220,6 +240,8 @@ static void do_seek(Player* p, double target) {
     p->eof = false;
     p->ended = false;
     p->ended_fired = false;
+    p->precise_v = ts / (double)AV_TIME_BASE;  // consumers drop up to here
+    p->precise_a = ts / (double)AV_TIME_BASE;
 }
 
 void demux_thread(Player* p) {
@@ -234,7 +256,7 @@ void demux_thread(Player* p) {
     if (p->vst >= 0) p->th_vdec = std::thread(video_decode_thread, p);
     if (p->ast >= 0) {
         p->th_adec = std::thread(audio_decode_thread, p);
-        p->ao.start(&p->afq, &p->aq_serial);
+        p->ao.start(&p->afq, &p->aq_serial, &p->precise_a);
         p->ao.pause(p->paused);
     }
     if (p->vst >= 0) p->th_vrender = std::thread(video_render_thread, p);
