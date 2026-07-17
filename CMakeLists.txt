@@ -47,8 +47,11 @@ set_target_properties(MediaGallery PROPERTIES
 target_compile_definitions(MediaGallery PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
 
 if(MSVC)
-    # Hardened, static-CRT release binary; /W4 warnings.
-    target_compile_options(MediaGallery PRIVATE /W4 /EHsc /guard:cf)
+    # Hardened, static-CRT release binary; /W4 warnings. /utf-8 is required:
+    # the source uses UTF-8 literals for UI glyphs (rotate arrows, ◀/▶, em
+    # dashes) and without it MSVC decodes them in the system codepage and
+    # renders garbage. Matches the engine/player targets.
+    target_compile_options(MediaGallery PRIVATE /W4 /EHsc /guard:cf /utf-8)
     target_link_options(MediaGallery PRIVATE /DYNAMICBASE /NXCOMPAT /guard:cf /MANIFEST:NO)
 else()
     # clang/mingw
