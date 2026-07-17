@@ -3,6 +3,10 @@
 // ffplay.
 #include "player_int.h"
 
+extern "C" {
+#include <libavutil/tx.h>
+}
+
 static void run_decoder(Player* p, AVCodecContext* ctx, PacketQueue* pq,
                         std::atomic<int>* serial_mirror, FrameQueue* fq,
                         AVRational tb, const char* tag) {
@@ -54,9 +58,91 @@ void audio_decode_thread(Player* p) {
                 p->fmt->streams[p->ast]->time_base, "audio");
 }
 
+// Composite libass output for `pts` (sub-delay applied) as a full-frame
+// overlay bitmap the D3D path scales into the letterbox. No-op when the
+// media has no styled ASS stream.
+static void add_ass_overlay(Player* p, double pts, int w, int h, SubRender& ov) {
+    if (!p->ass || w <= 0 || h <= 0 || std::isnan(pts)) return;
+    auto b = std::make_shared<SubBitmap>();
+    {
+        std::lock_guard<std::mutex> lk(p->ass_m);
+        if (!p->ass) return;
+        if (!ass_render(p->ass, pts - p->sub_delay, w, h, b->pixels)) return;
+    }
+    b->x = 0;
+    b->y = 0;
+    b->w = w;
+    b->h = h;
+    b->src_w = w;
+    b->src_h = h;
+    b->start = pts;
+    b->end = pts;
+    ov.bitmaps.push_back(std::move(b));
+}
+
 // ------------------------------------------------------------ video render
 
+// Audio-only media: ~30fps spectrum bars from the audio tap (FFmpeg's own
+// RDFT), with the track metadata standing in for subtitle text.
+static void viz_render_loop(Player* p) {
+    const int N = 1024, BARS = 48;
+    AVTXContext* tx = nullptr;
+    av_tx_fn tx_fn = nullptr;
+    float scale = 1.0f;
+    if (av_tx_init(&tx, &tx_fn, AV_TX_FLOAT_RDFT, 0, N, &scale, 0) < 0) return;
+
+    std::vector<float> samples(N), win(N), fftin(N), fftout(N + 2);
+    std::vector<float> bars(BARS, 0.0f), smooth(BARS, 0.0f);
+    for (int i = 0; i < N; i++)
+        win[i] = 0.5f - 0.5f * cosf(6.2831853f * i / (N - 1));
+
+    while (!p->abort) {
+        SubRender ov;
+        ov.osd = p->osd_now();
+        {
+            std::lock_guard<std::mutex> lk(p->tracks_m);
+            if (!p->meta_title.empty()) {
+                ov.text = p->meta_title;
+                if (!p->meta_artist.empty())
+                    ov.text += L"\n" + p->meta_artist;
+            }
+        }
+
+        if (!p->paused && p->ao.tap(samples.data(), N)) {
+            for (int i = 0; i < N; i++) fftin[i] = samples[i] * win[i];
+            tx_fn(tx, fftout.data(), fftin.data(), sizeof(float));
+            for (int b = 0; b < BARS; b++) {
+                // log-spaced bins, 1..N/2
+                int i0 = (int)pow((double)(N / 2), (double)b / BARS);
+                int i1 = (int)pow((double)(N / 2), (double)(b + 1) / BARS);
+                if (i0 < 1) i0 = 1;
+                if (i1 <= i0) i1 = i0 + 1;
+                if (i1 > N / 2) i1 = N / 2;
+                float e = 0;
+                for (int i = i0; i < i1; i++) {
+                    float re = fftout[2 * i], im = fftout[2 * i + 1];
+                    e += re * re + im * im;
+                }
+                e /= (float)(i1 - i0);
+                float db = 10.0f * log10f(e + 1e-9f);
+                float v = (db + 60.0f) / 60.0f;
+                v = v < 0 ? 0 : v > 1 ? 1.0f : v;
+                smooth[b] = smooth[b] * 0.7f + v * 0.3f;
+                bars[b] = smooth[b];
+            }
+        }
+        p->vo->render_viz(bars.data(), BARS, ov);
+        Sleep(33);
+    }
+    av_tx_uninit(&tx);
+}
+
 void video_render_thread(Player* p) {
+    if (p->vst < 0) {
+        viz_render_loop(p);
+        log_line("viz render thread exit");
+        return;
+    }
     bool first_frame = true;
     int fps_count = 0;
     double fps = 0;
@@ -66,7 +152,20 @@ void video_render_thread(Player* p) {
         if (p->paused) {
             if (p->step_req.exchange(false)) {
                 FQFrame fr;
-                if (p->vfq.pop(fr, 200)) {
+                bool got = p->vfq.pop(fr, 200);
+                // Exact seek while paused (frame-back): discard decoded
+                // frames before the target, like the playing path does.
+                for (int guard = 0; got && guard < 400; guard++) {
+                    double pv = p->precise_v.load();
+                    if (std::isnan(pv) || std::isnan(fr.pts) ||
+                        fr.pts + (fr.dur > 0 ? fr.dur : 0.040) > pv) {
+                        p->precise_v = NAN;
+                        break;
+                    }
+                    av_frame_free(&fr.f);
+                    got = p->vfq.pop(fr, 200);
+                }
+                if (got) {
                     if (fr.serial == p->vq.serial()) {
                         double pts = fr.pts;
                         SubRender ov;
@@ -74,6 +173,7 @@ void video_render_thread(Player* p) {
                         if (!std::isnan(pts)) {
                             ov.text = p->subs.active_at(pts - p->sub_delay);
                             p->subs.active_bitmaps_at(pts - p->sub_delay, ov.bitmaps);
+                            add_ass_overlay(p, pts, fr.f->width, fr.f->height, ov);
                         }
                         p->vo->render(fr.f, ov, p->rotation);
                         if (!std::isnan(pts)) {
@@ -97,6 +197,8 @@ void video_render_thread(Player* p) {
                     if (!std::isnan(lp)) {
                         ov.text = p->subs.active_at(lp - p->sub_delay);
                         p->subs.active_bitmaps_at(lp - p->sub_delay, ov.bitmaps);
+                        add_ass_overlay(p, lp, p->last_frame->width,
+                                        p->last_frame->height, ov);
                     }
                     p->vo->render(p->last_frame, ov, p->rotation);
                 }
@@ -179,6 +281,7 @@ void video_render_thread(Player* p) {
         if (!std::isnan(pts)) {
             ov.text = p->subs.active_at(pts - p->sub_delay);
             p->subs.active_bitmaps_at(pts - p->sub_delay, ov.bitmaps);
+            add_ass_overlay(p, pts, fr.f->width, fr.f->height, ov);
         }
         p->vo->render(fr.f, ov, p->rotation);
         if (!std::isnan(pts)) p->vclock.store(pts);

@@ -44,6 +44,8 @@ enum {
     IDM_CHAP_BASE = 500,  // ..563
     IDM_ADEV_DEFAULT = 599, IDM_ADEV_BASE = 600,  // ..631
     IDT_PREV = 701, IDT_PLAY = 702, IDT_NEXT = 703,  // taskbar thumb buttons
+    IDM_START_FS = 720, IDM_HWDEC = 721,
+    IDM_MON_BASE = 730,  // ..761 (index 31 = "current")
 };
 #define MSG_PLAYER_EVENT (WM_APP + 1)
 #define MSG_PREVIEW_READY (WM_APP + 2)
@@ -78,12 +80,35 @@ static WINDOWPLACEMENT g_loaded_placement = {sizeof(WINDOWPLACEMENT)};
 static int g_loaded_vol = -1;   // 0..200, -1 = not in state file
 static int g_loaded_mute = 0;
 static bool g_loaded_fs = false;
+static int g_fs_monitor = -1;  // fullscreen display index; -1 = window's current
 static int g_loaded_subscale = 100;
+
+// One list drives folder scanning, the open dialog and Explorer
+// registration; keep the dialog filter string below in sync.
+static const wchar_t* kVideoExts[] = {
+    L".mp4", L".m4v", L".mov", L".mkv", L".webm", L".avi",
+    L".ts", L".m2ts", L".mts", L".flv", L".wmv", L".asf",
+    L".ogv", L".mpg", L".mpeg", L".vob", L".3gp",
+};
+
+static const wchar_t* kAudioExts[] = {
+    L".mp3", L".flac", L".m4a", L".ogg", L".oga", L".wav",
+    L".wma", L".opus", L".aac", L".ac3", L".mka",
+};
 
 static bool is_video_ext(const wchar_t* path) {
     const wchar_t* dot = wcsrchr(path, L'.');
     if (!dot) return false;
-    for (const wchar_t* e : {L".mp4", L".m4v", L".mov", L".mkv", L".webm", L".avi"})
+    for (const wchar_t* e : kVideoExts)
+        if (!_wcsicmp(dot, e)) return true;
+    return false;
+}
+
+static bool is_media_ext(const wchar_t* path) {
+    if (is_video_ext(path)) return true;
+    const wchar_t* dot = wcsrchr(path, L'.');
+    if (!dot) return false;
+    for (const wchar_t* e : kAudioExts)
         if (!_wcsicmp(dot, e)) return true;
     return false;
 }
@@ -103,6 +128,7 @@ static void save_state(HWND hwnd) {
     if (!f) return;
     fwprintf(f, L"A|%d\n", g_autonext ? 1 : 0);
     fwprintf(f, L"P|%d|%d\n", g_repeat, g_shuffle ? 1 : 0);
+    fwprintf(f, L"H|%d\n", g_fs_monitor);
     fwprintf(f, L"F|%d\n", g_fullscreen ? 1 : 0);
     if (g_player)
         fwprintf(f, L"S|%d\n", (int)(player_sub_scale(g_player) * 100 + 0.5));
@@ -148,6 +174,8 @@ static void load_state() {
             }
         } else if (line[0] == L'F' && line[1] == L'|') {
             g_loaded_fs = line[2] == L'1';
+        } else if (line[0] == L'H' && line[1] == L'|') {
+            g_fs_monitor = _wtoi(line + 2);
         } else if (line[0] == L'S' && line[1] == L'|') {
             int s = _wtoi(line + 2);
             if (s >= 50 && s <= 200) g_loaded_subscale = s;
@@ -212,7 +240,7 @@ static void build_siblings(const wchar_t* path) {
     HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && is_video_ext(fd.cFileName))
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && is_media_ext(fd.cFileName))
             g_siblings.push_back(dir + L"\\" + fd.cFileName);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
@@ -465,20 +493,45 @@ static void fs_autohide_tick(HWND hwnd) {
     }
 }
 
+// Enumerate monitors so fullscreen can target a chosen display.
+static BOOL CALLBACK collect_mon(HMONITOR h, HDC, LPRECT, LPARAM lp) {
+    ((std::vector<HMONITOR>*)lp)->push_back(h);
+    return TRUE;
+}
+static std::vector<HMONITOR> list_monitors() {
+    std::vector<HMONITOR> v;
+    EnumDisplayMonitors(nullptr, nullptr, collect_mon, (LPARAM)&v);
+    return v;
+}
+
+// mon_index < 0 uses the monitor the window is on; otherwise that display.
+static void go_fullscreen_on(HWND hwnd, int mon_index) {
+    DWORD style = GetWindowLongW(hwnd, GWL_STYLE);
+    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+    if (mon_index >= 0) {
+        auto mons = list_monitors();
+        if (mon_index < (int)mons.size()) mon = mons[mon_index];
+    }
+    MONITORINFO mi = {sizeof(MONITORINFO)};
+    if (!g_fullscreen && GetWindowPlacement(hwnd, &g_saved_placement) &&
+        GetMonitorInfoW(mon, &mi)) {
+        g_fullscreen = true;
+        SetWindowLongW(hwnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
+        SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        g_fs_bar = true;
+    }
+}
+
 static void toggle_fullscreen(HWND hwnd) {
     DWORD style = GetWindowLongW(hwnd, GWL_STYLE);
     if (!g_fullscreen) {
-        MONITORINFO mi = {sizeof(MONITORINFO)};
-        if (GetWindowPlacement(hwnd, &g_saved_placement) &&
-            GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
-            g_fullscreen = true;
-            SetWindowLongW(hwnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
-            SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
-                         mi.rcMonitor.right - mi.rcMonitor.left,
-                         mi.rcMonitor.bottom - mi.rcMonitor.top,
-                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-        }
-    } else {
+        go_fullscreen_on(hwnd, g_fs_monitor);
+        return;
+    }
+    {
         g_fullscreen = false;
         SetWindowLongW(hwnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
         SetWindowPlacement(hwnd, &g_saved_placement);
@@ -542,8 +595,17 @@ static void register_associations(HWND hwnd) {
     bool ok = setkey(progid, nullptr, L"Video file (minimal-player)");
     ok = setkey(std::wstring(progid) + L"\\DefaultIcon", nullptr, icon) && ok;
     ok = setkey(std::wstring(progid) + L"\\shell\\open\\command", nullptr, cmd) && ok;
-    for (const wchar_t* ext : {L".mp4", L".m4v", L".mov", L".mkv", L".webm",
-                               L".avi", L".m3u", L".m3u8"})
+    for (const wchar_t* ext : kVideoExts)
+        ok = setkey(std::wstring(L"Software\\Classes\\") + ext +
+                        L"\\OpenWithProgids",
+                    L"minimal-player.video", L"") &&
+             ok;
+    for (const wchar_t* ext : kAudioExts)
+        ok = setkey(std::wstring(L"Software\\Classes\\") + ext +
+                        L"\\OpenWithProgids",
+                    L"minimal-player.video", L"") &&
+             ok;
+    for (const wchar_t* ext : {L".m3u", L".m3u8"})
         ok = setkey(std::wstring(L"Software\\Classes\\") + ext +
                         L"\\OpenWithProgids",
                     L"minimal-player.video", L"") &&
@@ -718,6 +780,23 @@ static void taskbar_update(HWND hwnd) {
     }
 }
 
+// Warm the OS file cache for the likely-next file so N / auto-advance
+// starts near-instantly. Detached, best-effort, one at a time.
+static void prefetch_next() {
+    std::wstring next;
+    if (!g_playlist.empty()) {
+        if (g_pl_cur >= 0 && g_pl_cur + 1 < (int)g_playlist.size())
+            next = g_playlist[g_pl_cur + 1];
+    } else if (g_sib_cur >= 0 && g_sib_cur + 1 < (int)g_siblings.size()) {
+        next = g_siblings[g_sib_cur + 1];
+    }
+    if (next.empty() || wcsstr(next.c_str(), L"://")) return;
+    std::thread([next] {
+        PlayerMediaInfo info;
+        player_probe(next.c_str(), &info);  // opens+closes: header into cache
+    }).detach();
+}
+
 static void open_path(HWND hwnd, const wchar_t* path) {
     if (!g_player) return;
     remember_position();
@@ -736,6 +815,7 @@ static void open_path(HWND hwnd, const wchar_t* path) {
     if (!g_cur_is_url)
         SHAddToRecentDocs(SHARD_PATHW, path);  // taskbar "Recent" jump list
     player_open(g_player, path);
+    prefetch_next();
     update_ui(hwnd);
 }
 
@@ -943,8 +1023,11 @@ static void open_dialog(HWND hwnd) {
     wchar_t path[MAX_PATH] = L"";
     OPENFILENAMEW ofn = {sizeof(OPENFILENAMEW)};
     ofn.hwndOwner = hwnd;
-    ofn.lpstrFilter = L"Video and playlists\0"
-                      L"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.m3u;*.m3u8\0"
+    ofn.lpstrFilter = L"Media and playlists\0"
+                      L"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.ts;*.m2ts;"
+                      L"*.mts;*.flv;*.wmv;*.asf;*.ogv;*.mpg;*.mpeg;*.vob;"
+                      L"*.3gp;*.mp3;*.flac;*.m4a;*.ogg;*.oga;*.wav;*.wma;"
+                      L"*.opus;*.aac;*.ac3;*.mka;*.m3u;*.m3u8\0"
                       L"All files\0*.*\0";
     ofn.lpstrFile = path;
     ofn.nMaxFile = MAX_PATH;
@@ -1063,6 +1146,30 @@ static void show_context_menu(HWND hwnd, int x, int y) {
     }
     if (ac > 0 || sc > 0 || cc > 0 || dc > 0) AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (g_fullscreen ? MF_CHECKED : 0), IDM_FULL, L"Fullscreen\tF");
+    {
+        auto mons = list_monitors();
+        if (mons.size() > 1) {
+            HMENU mm = CreatePopupMenu();
+            AppendMenuW(mm, MF_STRING | (g_fs_monitor < 0 ? MF_CHECKED : 0),
+                        IDM_MON_BASE + 31, L"Current");
+            for (int i = 0; i < (int)mons.size() && i < 8; i++) {
+                MONITORINFOEXW mi = {};
+                mi.cbSize = sizeof(mi);
+                wchar_t label[64];
+                if (GetMonitorInfoW(mons[i], &mi))
+                    swprintf(label, 64, L"Display %d (%ldx%ld)", i + 1,
+                             mi.rcMonitor.right - mi.rcMonitor.left,
+                             mi.rcMonitor.bottom - mi.rcMonitor.top);
+                else
+                    swprintf(label, 64, L"Display %d", i + 1);
+                AppendMenuW(mm, MF_STRING | (g_fs_monitor == i ? MF_CHECKED : 0),
+                            IDM_MON_BASE + i, label);
+            }
+            AppendMenuW(m, MF_POPUP, (UINT_PTR)mm, L"Fullscreen Display");
+        }
+    }
+    AppendMenuW(m, MF_STRING | (g_player && player_hw_decode(g_player) ? MF_CHECKED : 0),
+                IDM_HWDEC, L"Hardware Decode");
     AppendMenuW(m, MF_STRING | (g_player && player_is_muted(g_player) ? MF_CHECKED : 0),
                 IDM_MUTE, L"Mute\tM");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -1081,6 +1188,31 @@ static void on_key(HWND hwnd, WPARAM key) {
             osd_volume();
             break;
         case VK_OEM_PERIOD: player_frame_step(g_player); osd(L"Frame step"); break;
+        case VK_OEM_COMMA: player_frame_back(g_player); osd(L"Frame back"); break;
+        case 'K':  // shuttle centre: back to 1x, toggle pause
+            player_set_speed(g_player, 1.0);
+            play_pause();
+            osd(L"x1.0");
+            break;
+        case 'L': {  // shuttle forward: ramp 1x -> 1.5x -> 2x -> 4x
+            static const double sp[] = {1.0, 1.5, 2.0, 4.0};
+            if (player_is_paused(g_player)) player_toggle_pause(g_player);
+            double cur = player_speed(g_player);
+            int idx = 0;
+            for (int i = 0; i < 4; i++) if (cur >= sp[i] - 0.01) idx = i;
+            if (idx < 3) idx++;
+            player_set_speed(g_player, sp[idx]);
+            wchar_t b[32];
+            swprintf(b, 32, L"▶▶ x%.1f", sp[idx]);
+            osd(b);
+            break;
+        }
+        case 'J':  // no true reverse decode: fast-rewind by stepped seeks
+            player_set_speed(g_player, 1.0);
+            if (player_is_paused(g_player)) player_toggle_pause(g_player);
+            player_seek_rel(g_player, -15);
+            osd(L"◀◀ -15s");
+            break;
         case VK_LEFT: player_seek_rel(g_player, -10); osd(L"-10s"); break;
         case VK_RIGHT: player_seek_rel(g_player, 10); osd(L"+10s"); break;
         case VK_PRIOR:
@@ -1105,7 +1237,7 @@ static void on_key(HWND hwnd, WPARAM key) {
         case VK_DOWN: player_volume_step(g_player, -1); osd_volume(); break;
         case 'A': player_cycle_audio(g_player); remember_tracks(); break;
         case 'S': player_cycle_subtitle(g_player); remember_tracks(); break;
-        case 'L':
+        case 'B':  // A-B loop (moved off L, which is now shuttle-forward)
             if (g_loop_a < 0) {
                 g_loop_a = player_position(g_player);
                 osd(L"Loop: A set");
@@ -1268,6 +1400,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDT_PLAY: play_pause(); break;
                 case IDM_AUTONEXT: g_autonext = !g_autonext; break;
                 case IDM_SNAPSHOT: do_snapshot(hwnd); break;
+                case IDM_HWDEC:
+                    if (g_player) {
+                        bool on = !player_hw_decode(g_player);
+                        player_set_hw_decode(g_player, on);
+                        osd(on ? L"Hardware decode: on (reopens)"
+                               : L"Hardware decode: off (reopens)");
+                    }
+                    break;
                 case IDM_PIC_BR_UP:
                 case IDM_PIC_BR_DN:
                 case IDM_PIC_CO_UP:
@@ -1336,6 +1476,17 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     else if (g_player && LOWORD(wp) >= IDM_CHAP_BASE &&
                              LOWORD(wp) < IDM_CHAP_BASE + 64)
                         player_chapter_go(g_player, LOWORD(wp) - IDM_CHAP_BASE);
+                    else if (LOWORD(wp) >= IDM_MON_BASE &&
+                             LOWORD(wp) < IDM_MON_BASE + 32) {
+                        int sel = LOWORD(wp) - IDM_MON_BASE;
+                        g_fs_monitor = (sel == 31) ? -1 : sel;
+                        if (g_fullscreen) {  // re-fullscreen on the new display
+                            toggle_fullscreen(hwnd);
+                            go_fullscreen_on(hwnd, g_fs_monitor);
+                            SetWindowTextW(g_full, L"Exit FS");
+                            layout(hwnd);
+                        }
+                    }
                     else if (g_player && LOWORD(wp) == IDM_ADEV_DEFAULT) {
                         player_set_audio_device(g_player, nullptr);
                         osd(L"Audio: System Default");
@@ -1398,7 +1549,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_pl_cur = -1;
                 for (UINT i = 0; i < n; i++)
                     if (DragQueryFileW((HDROP)wp, i, path, MAX_PATH) &&
-                        is_video_ext(path))
+                        is_media_ext(path))
                         g_playlist.push_back(path);
                 if (!g_playlist.empty()) {
                     playlist_play(hwnd, 0);
@@ -1470,7 +1621,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // A second launch hands its file(s) over and exits (dwData 1 =
             // open, 2 = enqueue into the playlist).
             COPYDATASTRUCT* cds = (COPYDATASTRUCT*)lp;
-            if (cds && cds->lpData && cds->cbData >= sizeof(wchar_t)) {
+            if (cds && cds->lpData && cds->cbData >= sizeof(wchar_t) &&
+                cds->cbData <= 8192) {  // a path; anything bigger is hostile
                 std::wstring path((const wchar_t*)cds->lpData,
                                   cds->cbData / sizeof(wchar_t));
                 while (!path.empty() && path.back() == 0) path.pop_back();
@@ -1498,6 +1650,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (tm != g_track_mem.end())  // no-op when already matching
                     player_select_tracks(g_player, tm->second.first,
                                          tm->second.second);
+                if (player_is_audio_only(g_player)) {
+                    wchar_t ti[128], ar[128], np[280];
+                    player_meta(g_player, 0, ti, 128);
+                    player_meta(g_player, 1, ar, 128);
+                    if (ti[0]) {
+                        swprintf(np, 280, ar[0] ? L"%s — %s" : L"%s", ti, ar);
+                        player_show_osd(g_player, np, 4.0);
+                    }
+                }
             } else if ((PlayerEvent)wp == PLAYER_EVT_ENDED) {
                 g_resume.erase(g_cur_path);
                 if (g_repeat == 2 && g_player)
@@ -1576,6 +1737,7 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int show) {
         }
     }
 
+    HeapSetInformation(nullptr, HeapEnableTerminationOnCorruption, nullptr, 0);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     srand(GetTickCount());
     g_msg_tbcreated = RegisterWindowMessageW(L"TaskbarButtonCreated");
@@ -1673,7 +1835,7 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int show) {
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv && argc > 2) {  // several files on the command line = a queue
         for (int i = 1; i < argc; i++)
-            if (is_video_ext(argv[i])) g_playlist.push_back(argv[i]);
+            if (is_media_ext(argv[i])) g_playlist.push_back(argv[i]);
         if (!g_playlist.empty()) playlist_play(g_main, 0);
         else open_any(g_main, argv[1]);
     } else if (argv && argc > 1) {

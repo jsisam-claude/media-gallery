@@ -11,24 +11,7 @@ extern "C" {
 #include <libavutil/display.h>
 }
 
-// Rotate packed BGRA clockwise by 0/90/180/270 into out; returns new dims.
-static void rotate_bgra(const uint32_t* in, int w, int h, int rot,
-                        std::vector<uint32_t>& out, int* ow_out, int* oh_out) {
-    int ow = (rot == 90 || rot == 270) ? h : w;
-    int oh = (rot == 90 || rot == 270) ? w : h;
-    out.resize((size_t)ow * oh);
-    for (int y = 0; y < oh; y++)
-        for (int x = 0; x < ow; x++) {
-            int sx, sy;
-            if (rot == 90) { sx = y; sy = h - 1 - x; }
-            else if (rot == 270) { sx = w - 1 - y; sy = x; }
-            else if (rot == 180) { sx = w - 1 - x; sy = h - 1 - y; }
-            else { sx = x; sy = y; }
-            out[(size_t)y * ow + x] = in[(size_t)sy * w + sx];
-        }
-    *ow_out = ow;
-    *oh_out = oh;
-}
+#include "pixops.h"  // rotate_bgra (pure, unit-tested)
 
 static void engine_av_log(void*, int level, const char* fmt, va_list args) {
     if (level > AV_LOG_WARNING) return;
@@ -93,6 +76,10 @@ static void stop_pipeline(Player* p) {
     avcodec_free_context(&p->vctx);
     avcodec_free_context(&p->actx);
     avcodec_free_context(&p->sctx);
+    {
+        std::lock_guard<std::mutex> lk(p->ass_m);
+        if (p->ass) { ass_destroy(p->ass); p->ass = nullptr; }
+    }
     if (p->fmt) avformat_close_input(&p->fmt);
 
     p->vq.set_abort(false);
@@ -109,6 +96,10 @@ static void stop_pipeline(Player* p) {
         p->audio_names.clear();
         p->sub_names.clear();
         p->chapters.clear();
+        p->meta_title.clear();
+        p->meta_artist.clear();
+        p->meta_album.clear();
+        p->cover_only = false;
     }
     p->vst = p->ast = p->sst = -1;
     p->rotation = 0;
@@ -193,6 +184,18 @@ void player_frame_step(Player* p) {
     if (!p->paused) player_toggle_pause(p);
     p->step_req = true;
 }
+
+void player_frame_back(Player* p) {
+    if (!p->running) return;
+    if (!p->paused) player_toggle_pause(p);
+    // Exact-seek slightly behind the shown frame, then step to display it.
+    double pos = player_position(p);
+    player_seek_to(p, pos > 0.07 ? pos - 0.07 : 0);
+    p->step_req = true;
+}
+
+void player_set_hw_decode(Player* p, bool on) { p->want_hw = on; }
+bool player_hw_decode(Player* p) { return p->want_hw; }
 
 void player_seek_to(Player* p, double seconds) {
     if (!p->running) return;
@@ -375,6 +378,22 @@ int player_chapter_seek(Player* p, int delta) {
     return next;
 }
 
+void player_meta(Player* p, int which, wchar_t* buf, size_t buflen) {
+    if (!buf || !buflen) return;
+    buf[0] = 0;
+    std::lock_guard<std::mutex> lk(p->tracks_m);
+    const std::wstring& s = which == 1   ? p->meta_artist
+                            : which == 2 ? p->meta_album
+                                         : p->meta_title;
+    wcsncpy(buf, s.c_str(), buflen - 1);
+    buf[buflen - 1] = 0;
+}
+
+bool player_is_audio_only(Player* p) {
+    std::lock_guard<std::mutex> lk(p->tracks_m);
+    return p->running && (p->vst < 0 || p->cover_only);
+}
+
 void player_show_osd(Player* p, const wchar_t* text, double seconds) {
     {
         std::lock_guard<std::mutex> lk(p->osd_m);
@@ -448,6 +467,19 @@ static int deadline_interrupt(void* op) {
     return av_gettime_relative() > *(int64_t*)op ? 1 : 0;
 }
 
+// Least-privilege protocol set + forced TLS verification for avformat
+// opens (see demux.cpp open_input for the rationale). Caller frees.
+static AVDictionary* safe_open_opts(const std::string& u8) {
+    AVDictionary* opts = nullptr;
+    if (u8.find("://") != std::string::npos) {
+        av_dict_set(&opts, "protocol_whitelist", "http,https,tcp,tls,udp,crypto,data", 0);
+        av_dict_set(&opts, "tls_verify", "1", 0);
+    } else {
+        av_dict_set(&opts, "protocol_whitelist", "file,crypto,data", 0);
+    }
+    return opts;
+}
+
 bool player_probe(const wchar_t* path, PlayerMediaInfo* info) {
     if (!info) return false;
     memset(info, 0, sizeof(*info));
@@ -457,7 +489,10 @@ bool player_probe(const wchar_t* path, PlayerMediaInfo* info) {
     if (!fc) return false;
     fc->interrupt_callback.callback = deadline_interrupt;
     fc->interrupt_callback.opaque = &deadline;
-    if (avformat_open_input(&fc, u8.c_str(), nullptr, nullptr) < 0) return false;
+    AVDictionary* opts = safe_open_opts(u8);
+    int oret = avformat_open_input(&fc, u8.c_str(), nullptr, &opts);
+    av_dict_free(&opts);
+    if (oret < 0) return false;
     if (avformat_find_stream_info(fc, nullptr) < 0) {
         avformat_close_input(&fc);
         return false;
@@ -501,7 +536,10 @@ bool player_extract_thumb_at(const wchar_t* path, double at_seconds,
     if (!fc) return false;
     fc->interrupt_callback.callback = deadline_interrupt;
     fc->interrupt_callback.opaque = &deadline;
-    if (avformat_open_input(&fc, u8.c_str(), nullptr, nullptr) < 0) return false;
+    AVDictionary* opts = safe_open_opts(u8);
+    int oret = avformat_open_input(&fc, u8.c_str(), nullptr, &opts);
+    av_dict_free(&opts);
+    if (oret < 0) return false;
 
     AVCodecContext* ctx = nullptr;
     AVFrame* frame = nullptr;

@@ -30,6 +30,7 @@ static AVPixelFormat get_d3d11_format(AVCodecContext* ctx, const AVPixelFormat* 
 // Wraps the renderer's D3D11 device for libavcodec. Sharing one device
 // keeps decoder output textures directly usable by the video processor.
 static AVBufferRef* create_hw_device(Player* p) {
+    if (!p->want_hw) return nullptr;  // user disabled hardware decode
     ID3D11Device* dev = p->vo ? p->vo->decode_device() : nullptr;
     if (!dev) return nullptr;
     AVBufferRef* ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
@@ -87,7 +88,19 @@ static bool open_input(Player* p) {
         return ((Player*)op)->abort ? 1 : 0;
     };
     p->fmt->interrupt_callback.opaque = p;
-    int ret = avformat_open_input(&p->fmt, u8.c_str(), nullptr, nullptr);
+    // Least-privilege protocol set per open: local files must never reach
+    // the network, URLs must never read local files (a hostile playlist
+    // could otherwise reference either). tls_verify is forced on - lavf 62
+    // still defaults to NOT verifying certificates (FF_API_NO_DEFAULT_TLS_VERIFY).
+    AVDictionary* opts = nullptr;
+    if (u8.find("://") != std::string::npos) {
+        av_dict_set(&opts, "protocol_whitelist", "http,https,tcp,tls,udp,crypto,data", 0);
+        av_dict_set(&opts, "tls_verify", "1", 0);
+    } else {
+        av_dict_set(&opts, "protocol_whitelist", "file,crypto,data", 0);
+    }
+    int ret = avformat_open_input(&p->fmt, u8.c_str(), nullptr, &opts);
+    av_dict_free(&opts);
     if (ret < 0) {
         char err[256];
         av_strerror(ret, err, sizeof(err));
@@ -192,6 +205,31 @@ static bool open_input(Player* p) {
     if (p->vst >= 0 && !p->vctx) p->vst = -1;
     if (p->ast >= 0 && !p->actx) p->ast = -1;
     if (p->sst >= 0 && !p->sctx) p->sst = -1;
+
+    // Styled subtitles: for an internal ASS/SSA stream, drive libass with
+    // the script header + any embedded font attachments. srt/mov_text/PGS
+    // keep the existing text/bitmap paths.
+    if (p->sctx && (p->sctx->codec_id == AV_CODEC_ID_ASS ||
+                    p->sctx->codec_id == AV_CODEC_ID_SSA)) {
+        std::lock_guard<std::mutex> lk(p->ass_m);
+        p->ass = ass_create();
+        if (p->ass) {
+            if (p->sctx->subtitle_header && p->sctx->subtitle_header_size > 0)
+                ass_set_header(p->ass, (const char*)p->sctx->subtitle_header,
+                               p->sctx->subtitle_header_size);
+            for (unsigned i = 0; i < p->fmt->nb_streams; i++) {
+                AVStream* st = p->fmt->streams[i];
+                if (st->codecpar->codec_type != AVMEDIA_TYPE_ATTACHMENT) continue;
+                AVDictionaryEntry* fn = av_dict_get(st->metadata, "filename",
+                                                    nullptr, 0);
+                if (fn && st->codecpar->extradata &&
+                    st->codecpar->extradata_size > 0)
+                    ass_add_attachment(p->ass, fn->value,
+                                       (const char*)st->codecpar->extradata,
+                                       st->codecpar->extradata_size);
+            }
+        }
+    }
     if (p->vst < 0 && p->ast < 0) {
         std::lock_guard<std::mutex> lk(p->err_m);
         p->error = L"No decodable streams in:\n" + p->path;
@@ -201,6 +239,22 @@ static bool open_input(Player* p) {
     p->duration = p->fmt->duration > 0 ? p->fmt->duration / (double)AV_TIME_BASE : 0;
     p->start_time = p->fmt->start_time != AV_NOPTS_VALUE
                         ? p->fmt->start_time / (double)AV_TIME_BASE : 0;
+
+    // Music metadata + cover-art detection (an attached_pic stream is a
+    // still image, not a real video track; it plays as a static frame).
+    {
+        auto metaval = [&](const char* key) -> std::wstring {
+            AVDictionaryEntry* e = av_dict_get(p->fmt->metadata, key, nullptr, 0);
+            return e && e->value[0] ? utf8_to_wide(e->value) : L"";
+        };
+        std::lock_guard<std::mutex> lk(p->tracks_m);
+        p->meta_title = metaval("title");
+        p->meta_artist = metaval("artist");
+        p->meta_album = metaval("album");
+        p->cover_only =
+            p->vst >= 0 && (p->fmt->streams[p->vst]->disposition &
+                            AV_DISPOSITION_ATTACHED_PIC) != 0;
+    }
 
     // Chapter list for host menus; start times shifted to position space.
     {
@@ -237,6 +291,10 @@ static void do_seek(Player* p, double target) {
     p->afq.flush();
     p->ao.flush();
     if (p->sst >= 0) p->subs.clear();  // internal subs re-fill; sidecar list stays
+    if (p->ass) {
+        std::lock_guard<std::mutex> lk(p->ass_m);
+        ass_reset(p->ass);
+    }
     p->extclk_set(NAN);
     {
         std::lock_guard<std::mutex> lk(p->extclk_m);
@@ -264,7 +322,9 @@ void demux_thread(Player* p) {
         p->ao.start(&p->afq, &p->aq_serial, &p->precise_a);
         p->ao.pause(p->paused);
     }
-    if (p->vst >= 0) p->th_vrender = std::thread(video_render_thread, p);
+    // Audio-only media still gets the render thread: it draws the spectrum
+    // visualization (no cover art) via the same VideoOut.
+    if (p->vst >= 0 || p->ast >= 0) p->th_vrender = std::thread(video_render_thread, p);
     p->running = true;
     p->fire(PLAYER_EVT_OPENED);
 
@@ -308,7 +368,10 @@ void demux_thread(Player* p) {
         } else if (pkt->stream_index == p->ast) {
             p->aq.push(pkt);
         } else if (pkt->stream_index == p->sst && p->sctx) {
-            subs_decode_packet(p->sctx, pkt, p->fmt->streams[p->sst]->time_base, &p->subs);
+            std::unique_lock<std::mutex> lk(p->ass_m, std::defer_lock);
+            if (p->ass) lk.lock();  // serialize libass feed vs. render
+            subs_decode_packet(p->sctx, pkt, p->fmt->streams[p->sst]->time_base,
+                               &p->subs, p->ass);
             av_packet_unref(pkt);
         } else {
             av_packet_unref(pkt);

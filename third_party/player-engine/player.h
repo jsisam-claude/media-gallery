@@ -28,6 +28,10 @@ bool player_media_ended(Player* p);
 void player_toggle_pause(Player* p);
 bool player_is_paused(Player* p);
 void player_frame_step(Player* p);  // pauses if playing, then advances one frame
+void player_frame_back(Player* p);  // pauses, then steps one frame backward
+// Hardware (D3D11VA) decode preference; applies from the next open.
+void player_set_hw_decode(Player* p, bool on);
+bool player_hw_decode(Player* p);
 void player_seek_rel(Player* p, double seconds);
 void player_seek_to(Player* p, double seconds);
 void player_volume_step(Player* p, int steps);
@@ -95,6 +99,12 @@ void player_set_aspect(Player* p, int mode);
 int player_aspect(Player* p);
 // Debug HUD (fps, drops, decode path, queue depths); returns the new state.
 bool player_toggle_hud(Player* p);
+
+// Music metadata: which = 0 title, 1 artist, 2 album (empty when absent).
+void player_meta(Player* p, int which, wchar_t* buf, size_t buflen);
+// True when the media has no real video track (pure audio, or audio with
+// attached cover art) - hosts may want a music-style UI.
+bool player_is_audio_only(Player* p);
 
 // Saves the currently displayed frame as a PNG (synchronous, WIC encoder;
 // call from a COM-initialized thread). Applies aspect ratio and rotation.
