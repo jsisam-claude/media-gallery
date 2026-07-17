@@ -65,6 +65,10 @@ if(PHOTOGALLERY_VIDEO)
     # see cmake/ffmpeg.cmake (copied verbatim from the player repo).
     include(cmake/ffmpeg.cmake)
 
+    # Vendored libass + FreeType + FriBidi + HarfBuzz, same source-only rules —
+    # see cmake/libass.cmake (copied verbatim). Styled ASS/SSA subtitles.
+    include(cmake/libass.cmake)
+
     # The embeddable engine; the app includes only player.h.
     add_library(player_engine STATIC
         third_party/player-engine/player.cpp
@@ -74,6 +78,7 @@ if(PHOTOGALLERY_VIDEO)
         third_party/player-engine/audio_out.cpp
         third_party/player-engine/video_out.cpp
         third_party/player-engine/subs.cpp
+        third_party/player-engine/ass_render.cpp
     )
     set_target_properties(player_engine PROPERTIES
         CXX_STANDARD 17
@@ -83,17 +88,27 @@ if(PHOTOGALLERY_VIDEO)
     target_compile_options(player_engine PRIVATE /W4 /utf-8)
     target_include_directories(player_engine PUBLIC third_party/player-engine)
     target_link_libraries(player_engine
-        PRIVATE ffmpeg
+        PRIVATE ffmpeg libass
         PUBLIC d3d11 dxgi d3dcompiler d2d1 dwrite windowscodecs ole32 avrt winmm user32
     )
 
     target_link_libraries(PhotoGallery PRIVATE player_engine)
 
+    # The shell's version resource is a configure_file template upstream;
+    # stamp the vendored player version (third_party/player-shell/VERSION)
+    # into it exactly as the player repo's own CMakeLists does.
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/third_party/player-shell/VERSION" PLAYER_VERSION)
+    string(STRIP "${PLAYER_VERSION}" PLAYER_VERSION)
+    string(REPLACE "." "," VER_COMMA "${PLAYER_VERSION}")
+    set(VER_DOT "${PLAYER_VERSION}")
+    configure_file(third_party/player-shell/version.rc.in
+        "${CMAKE_BINARY_DIR}/player-version.rc" @ONLY)
+
     # The standalone player, built from its vendored Win32 shell against the
     # same engine — one branch, one build, both apps.
     add_executable(minimal-player WIN32
         third_party/player-shell/main.cpp
-        third_party/player-shell/version.rc
+        "${CMAKE_BINARY_DIR}/player-version.rc"
         third_party/player-shell/app.manifest
     )
     set_target_properties(minimal-player PROPERTIES
