@@ -63,7 +63,15 @@ HBITMAP LoadShellThumb(const std::wstring& path, int px) {
                                               IID_IShellItemImageFactory,
                                               reinterpret_cast<void**>(&f)))) {
         SIZE sz{px, px};
-        if (FAILED(f->GetImage(sz, SIIGBF_RESIZETOFIT, &hbmp))) hbmp = nullptr;
+        // THUMBNAILONLY: make GetImage fail when there is no real thumbnail
+        // instead of substituting a generic file-type icon. Without it, on
+        // machines where the shell thumbnail service is off (many VMs, or the
+        // "Always show icons, never thumbnails" Explorer setting) every file
+        // came back as an icon, so the decode-it-ourselves fallback below was
+        // never reached.
+        if (FAILED(f->GetImage(sz, SIIGBF_RESIZETOFIT | SIIGBF_THUMBNAILONLY,
+                               &hbmp)))
+            hbmp = nullptr;
         f->Release();
     }
     if (!hbmp) {
