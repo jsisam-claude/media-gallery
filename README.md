@@ -6,9 +6,10 @@ downloads**. Pure C++ / WinAPI with GDI+ and WIC (both part of Windows) doing
 all *image* decoding, so every image parser is OS-maintained and
 security-patched by Windows Update. Optional *video* playback is the one
 exception to "zero third-party code": an embedded player engine plus an
-FFmpeg subset (LGPL-2.1+), vendored into `third_party/` as plain committed
-source and compiled by your own toolchain — nothing is fetched or prebuilt,
-but those parsers are updated by re-vendoring, not by Windows Update. Builds
+FFmpeg subset and libass (styled ASS/SSA subtitles) — all LGPL-2.1+,
+vendored into `third_party/` as plain committed source and compiled by your
+own toolchain — nothing is fetched or prebuilt, but those parsers are
+updated by re-vendoring, not by Windows Update. Builds
 without the engine (`src/player_stub.cpp`) remain image-only. Runs on stock
 Windows 10 and 11.
 
@@ -125,8 +126,9 @@ engine linked in.
 
 - All image decoding is done by OS codecs (GDI+/WIC) that receive Windows
   Update patches; no third-party or hand-written image parsers. Video
-  decoding (when built in) uses the vendored FFmpeg — in-process parsers
-  whose patch story is re-vendoring, not Windows Update.
+  decoding (when built in) uses the vendored FFmpeg, and styled subtitles the
+  vendored libass — in-process parsers of untrusted media, subtitle and font
+  data whose patch story is re-vendoring, not Windows Update.
 - A decompression-bomb guard caps decoded size (~134 MP) regardless of codec.
 - Wide-character APIs throughout; paths are canonicalized and checked against
   the decoder-derived extension allowlist before any use.
@@ -141,7 +143,8 @@ engine linked in.
   Image-only builds contain no network code at all. Video-enabled builds do
   embed FFmpeg's network protocols (http/https/tcp/udp, TLS via Windows
   Schannel) as part of the vendored engine — that code runs only if a caller
-  passes a URL, which the gallery never does.
+  passes a URL, which the gallery never does. The vendored libass adds no
+  network path; it only parses subtitle and font bytes already in hand.
 - No registry writes, no config files.
 
 ## Adding an image format

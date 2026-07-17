@@ -3,17 +3,18 @@
 The app is plain C++17 / WinAPI. Image viewing links only against
 components that ship with Windows (GDI+, WIC, shell, common dialogs).
 Video playback is optional and comes from source vendored into this repo
-(`third_party/`: the minimal-player engine + an FFmpeg subset, LGPL-2.1+)
-— still **no vcpkg, no NuGet, no downloads, no prebuilt binaries**; your
-toolchain compiles every byte from committed text.
+(`third_party/`: the minimal-player engine + an FFmpeg subset + libass, all
+LGPL-2.1+) — still **no vcpkg, no NuGet, no downloads, no prebuilt
+binaries**; your toolchain compiles every byte from committed text.
 
 Two kinds of build:
 
 - **Video-enabled** (`PhotoGallery.exe` plays mp4/m4v/mov/mkv/webm/avi):
   **CMake + MSVC only** — route 4 below. The vendored FFmpeg config is
   harvested from an MSVC x64 configure and cannot be built by MinGW, and
-  the ~400 FFmpeg translation units are only described in
-  `cmake/ffmpeg.cmake`.
+  the ~500 FFmpeg translation units are only described in
+  `cmake/ffmpeg.cmake` (libass + FreeType + FriBidi + HarfBuzz likewise in
+  `cmake/libass.cmake`).
 - **Image-only** (identical to the pre-video viewer): every other route.
   They compile `src/player_stub.cpp` (a no-op implementation of the
   engine API) and treat video files as unsupported.
@@ -81,8 +82,8 @@ engine, so this one branch yields both apps. Alternatively use
     cmake -B build -G "Visual Studio 17 2022" -A x64
     cmake --build build --config Release
 
-The first build compiles the vendored FFmpeg subset (~400 C files) once;
-afterwards it's cached. Pass `-DPHOTOGALLERY_VIDEO=OFF` to get the
+The first build compiles the vendored FFmpeg subset (~500 C files) plus the
+libass/FreeType/FriBidi/HarfBuzz subtitle stack once; afterwards it's cached. Pass `-DPHOTOGALLERY_VIDEO=OFF` to get the
 image-only viewer from CMake too (fast, and the only CMake mode for
 non-MSVC compilers, where it is forced OFF automatically).
 
@@ -108,7 +109,7 @@ needed at runtime).
 - Hardening is on by default for the app sources: `/W4`, SDL checks,
   Control Flow Guard (`/guard:cf`), DEP/ASLR; the MinGW build uses
   `-Wall -Wextra -Werror`. Vendored third-party code compiles at `/W0`
-  (FFmpeg) and `/W3` (engine).
+  (FFmpeg, libass) and `/W4` (engine).
 - The application manifest (per-monitor-v2 DPI awareness, `asInvoker`) is
   embedded via `src/PhotoGallery.rc`. For this reason the `.vcxproj` and the
   linker invocations set *GenerateManifest = false* / `/MANIFEST:NO` — if you
