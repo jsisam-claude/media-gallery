@@ -1,4 +1,4 @@
-# Photo Gallery
+# Media Gallery
 
 A minimal, secure Windows photo viewer in the spirit of the stock Windows Photo
 Viewer — single small native executable, **no packages, no DLLs, no
@@ -96,7 +96,7 @@ targets x86 and the link fails):
     cmake --preset x64-release
     cmake --build --preset x64-release
 
-Output: `build\x64-release\PhotoGallery.exe` **and**
+Output: `build\x64-release\MediaGallery.exe` **and**
 `build\x64-release\minimal-player.exe` — this one branch builds both the
 gallery and the standalone player (same engine, the player's Win32 shell
 is vendored under `third_party/player-shell/`). The first build compiles
@@ -106,9 +106,9 @@ what CI builds and uploads as artifacts on every push.
 
 **Image-only routes** (no video, identical to the pre-video viewer):
 
-Visual Studio solution — open **`PhotoGallery.sln`** and build (x64), or:
+Visual Studio solution — open **`MediaGallery.sln`** and build (x64), or:
 
-    msbuild PhotoGallery.sln -p:Configuration=Release -p:Platform=x64
+    msbuild MediaGallery.sln -p:Configuration=Release -p:Platform=x64
 
 Plain MSVC, no CMake — from an *x64 Native Tools Command Prompt*:
 
@@ -118,7 +118,7 @@ MinGW-w64 / cross-compile (also used for CI-style verification):
 
     make            # cross from Linux, or: mingw32-make CXX=g++ WINDRES=windres on MSYS2
 
-The output is a single self-contained `PhotoGallery.exe` (static CRT) that
+The output is a single self-contained `MediaGallery.exe` (static CRT) that
 runs on stock Windows 10/11 — ~370 KB image-only, a few MB with the video
 engine linked in.
 

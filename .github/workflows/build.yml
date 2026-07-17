@@ -24,8 +24,8 @@ jobs:
       - name: Upload gallery exe
         uses: actions/upload-artifact@v4
         with:
-          name: photo-gallery-win64
-          path: build/x64-release/PhotoGallery.exe
+          name: media-gallery-win64
+          path: build/x64-release/MediaGallery.exe
 
       - name: Upload standalone player exe
         uses: actions/upload-artifact@v4

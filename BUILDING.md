@@ -1,4 +1,4 @@
-# Building Photo Gallery
+# Building Media Gallery
 
 The app is plain C++17 / WinAPI. Image viewing links only against
 components that ship with Windows (GDI+, WIC, shell, common dialogs).
@@ -9,7 +9,7 @@ binaries**; your toolchain compiles every byte from committed text.
 
 Two kinds of build:
 
-- **Video-enabled** (`PhotoGallery.exe` plays mp4/m4v/mov/mkv/webm/avi):
+- **Video-enabled** (`MediaGallery.exe` plays mp4/m4v/mov/mkv/webm/avi):
   **CMake + MSVC only** — route 4 below. The vendored FFmpeg config is
   harvested from an MSVC x64 configure and cannot be built by MinGW, and
   the ~500 FFmpeg translation units are only described in
@@ -37,10 +37,10 @@ new-enough one).
 
 ## 1. Visual Studio IDE — image-only
 
-1. Open `PhotoGallery.sln`.
+1. Open `MediaGallery.sln`.
 2. Pick `Release | x64` in the toolbar.
 3. Build → *Build Solution* (Ctrl+Shift+B).
-4. Output: `x64\Release\PhotoGallery.exe`.
+4. Output: `x64\Release\MediaGallery.exe`.
 
 Press F5 to run/debug. To view a specific image while debugging, set
 *Project → Properties → Debugging → Command Arguments* to the image path.
@@ -52,9 +52,9 @@ repo instead — that picks up `CMakeLists.txt` and its presets.)
 From a **"Developer Command Prompt for VS 2022"** (or any shell where
 `msbuild` is on PATH), in the repo root:
 
-    msbuild PhotoGallery.sln -p:Configuration=Release -p:Platform=x64
+    msbuild MediaGallery.sln -p:Configuration=Release -p:Platform=x64
 
-Output: `x64\Release\PhotoGallery.exe`.
+Output: `x64\Release\MediaGallery.exe`.
 
 ## 3. Plain MSVC, no project files, no CMake — image-only
 
@@ -62,7 +62,7 @@ From an **"x64 Native Tools Command Prompt for VS 2022"**, in the repo root:
 
     build.bat
 
-Compiles all sources with `cl` in one shot and links `PhotoGallery.exe`
+Compiles all sources with `cl` in one shot and links `MediaGallery.exe`
 into the repo root. Fastest way to build if you don't care about a project.
 
 ## 4. CMake — the video-enabled build
@@ -73,7 +73,7 @@ step rejects the default x86 developer prompt):
     cmake --preset x64-release
     cmake --build --preset x64-release
 
-Output: `build\x64-release\PhotoGallery.exe` and, from the same build,
+Output: `build\x64-release\MediaGallery.exe` and, from the same build,
 `build\x64-release\minimal-player.exe` — the standalone player compiled
 from its vendored shell (`third_party/player-shell/`) against the same
 engine, so this one branch yields both apps. Alternatively use
@@ -83,7 +83,7 @@ engine, so this one branch yields both apps. Alternatively use
     cmake --build build --config Release
 
 The first build compiles the vendored FFmpeg subset (~500 C files) plus the
-libass/FreeType/FriBidi/HarfBuzz subtitle stack once; afterwards it's cached. Pass `-DPHOTOGALLERY_VIDEO=OFF` to get the
+libass/FreeType/FriBidi/HarfBuzz subtitle stack once; afterwards it's cached. Pass `-DMEDIAGALLERY_VIDEO=OFF` to get the
 image-only viewer from CMake too (fast, and the only CMake mode for
 non-MSVC compilers, where it is forced OFF automatically).
 
@@ -97,7 +97,7 @@ Cross-compile from Linux (package `g++-mingw-w64-x86-64`):
 
     make
 
-Output: `PhotoGallery.exe` in the repo root (fully static, no MinGW DLLs
+Output: `MediaGallery.exe` in the repo root (fully static, no MinGW DLLs
 needed at runtime).
 
 ## Build settings worth knowing
@@ -111,7 +111,7 @@ needed at runtime).
   `-Wall -Wextra -Werror`. Vendored third-party code compiles at `/W0`
   (FFmpeg, libass) and `/W4` (engine).
 - The application manifest (per-monitor-v2 DPI awareness, `asInvoker`) is
-  embedded via `src/PhotoGallery.rc`. For this reason the `.vcxproj` and the
+  embedded via `src/MediaGallery.rc`. For this reason the `.vcxproj` and the
   linker invocations set *GenerateManifest = false* / `/MANIFEST:NO` — if you
   create your own project file, do the same or the linker will error with a
   duplicate manifest resource (CVT1100/LNK1123).

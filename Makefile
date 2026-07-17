@@ -14,14 +14,14 @@ LIBS = -lgdiplus -lwindowscodecs -lshlwapi -lshell32 -lole32 -loleaut32 -luuid \
        -lcomdlg32 -lgdi32 -luser32
 LDFLAGS = -municode -mwindows -static -s -Wl,--dynamicbase -Wl,--nxcompat
 
-PhotoGallery.exe: $(SRC) src/decoder.h src/filmstrip.h src/resource.h \
+MediaGallery.exe: $(SRC) src/decoder.h src/filmstrip.h src/resource.h \
                   third_party/player-engine/player.h res.o
 	$(CXX) $(CXXFLAGS) -o $@ $(SRC) res.o $(LDFLAGS) $(LIBS)
 
-res.o: src/PhotoGallery.rc src/app.manifest src/resource.h
-	$(WINDRES) --include-dir=src src/PhotoGallery.rc res.o
+res.o: src/MediaGallery.rc src/app.manifest src/resource.h
+	$(WINDRES) --include-dir=src src/MediaGallery.rc res.o
 
 clean:
-	rm -f PhotoGallery.exe res.o
+	rm -f MediaGallery.exe res.o
 
 .PHONY: clean

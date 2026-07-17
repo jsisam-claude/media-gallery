@@ -21,7 +21,7 @@
       "name": "x64-release-novideo",
       "displayName": "x64 Release, image-only (stubbed player, fast build)",
       "inherits": "x64-release",
-      "cacheVariables": { "PHOTOGALLERY_VIDEO": "OFF" }
+      "cacheVariables": { "MEDIAGALLERY_VIDEO": "OFF" }
     }
   ],
   "buildPresets": [

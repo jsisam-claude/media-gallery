@@ -97,12 +97,12 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "FileDescription",  "Photo Gallery"
-            VALUE "ProductName",      "Photo Gallery"
+            VALUE "FileDescription",  "Media Gallery"
+            VALUE "ProductName",      "Media Gallery"
             VALUE "FileVersion",      "1.0.0.0"
             VALUE "ProductVersion",   "1.0.0.0"
-            VALUE "OriginalFilename", "PhotoGallery.exe"
-            VALUE "InternalName",     "PhotoGallery"
+            VALUE "OriginalFilename", "MediaGallery.exe"
+            VALUE "InternalName",     "MediaGallery"
         END
     END
     BLOCK "VarFileInfo"

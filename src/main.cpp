@@ -1,4 +1,4 @@
-// Photo Gallery — minimal, secure Windows photo viewer (WinAPI + modular decoders).
+// Media Gallery — minimal, secure Windows photo viewer (WinAPI + modular decoders).
 // See README.md for keys and design notes.
 #include <windows.h>
 #include <windowsx.h>
@@ -1055,9 +1055,9 @@ void UpdateTitle() {
         if (g.rot != 0) t += L"*";
         t += L" (" + std::to_wstring(g.cur + 1) + L"/" + std::to_wstring(g.files.size()) + L")";
         if (g.slideshow) t += L" — Slideshow (Esc to exit)";
-        t += L" — Photo Gallery";
+        t += L" — Media Gallery";
     } else {
-        t = L"Photo Gallery";
+        t = L"Media Gallery";
     }
     SetWindowTextW(g.hwnd, t.c_str());
 }
@@ -1237,7 +1237,7 @@ void MaybeCommitRotation() {
         std::wstring msg = L"Save the rotation to \"";
         msg += PathFindFileNameW(path.c_str());
         msg += L"\"?";
-        if (MessageBoxW(g.hwnd, msg.c_str(), L"Photo Gallery",
+        if (MessageBoxW(g.hwnd, msg.c_str(), L"Media Gallery",
                         MB_YESNO | MB_ICONQUESTION) == IDYES) {
             g.savePending = true;
             g.worker.RequestSave(path, g.rot);
@@ -1318,7 +1318,7 @@ void OpenTarget(const wchar_t* rawPath) {
         StartListThread(path, true);
     } else {
         if (!IsSupportedImage(path) && !IsPlayableVideo(path)) {
-            MessageBoxW(g.hwnd, L"This file type is not supported.", L"Photo Gallery",
+            MessageBoxW(g.hwnd, L"This file type is not supported.", L"Media Gallery",
                         MB_OK | MB_ICONINFORMATION);
             return;
         }
@@ -1368,7 +1368,7 @@ void HandleDrop(HDROP drop) {
             images.push_back(p);
     }
     if (images.empty()) {
-        MessageBoxW(g.hwnd, L"No supported files in the dropped items.", L"Photo Gallery",
+        MessageBoxW(g.hwnd, L"No supported files in the dropped items.", L"Media Gallery",
                     MB_OK | MB_ICONINFORMATION);
         return;
     }
@@ -1396,7 +1396,7 @@ void SaveRotationNow() {
     const std::wstring& path = g.files[g.cur];
     ImageDecoder* dec = FindDecoder(path);
     if (!dec || !dec->CanSaveRotation(path, *g.disp)) {
-        MessageBoxW(g.hwnd, L"Rotation can't be saved for this file type.", L"Photo Gallery",
+        MessageBoxW(g.hwnd, L"Rotation can't be saved for this file type.", L"Media Gallery",
                     MB_OK | MB_ICONINFORMATION);
         return;
     }
@@ -1557,7 +1557,7 @@ void OnSaved(SaveDone* d) {
     CacheRemovePath(d->path);
     g.strip.InvalidateThumb(d->path);
     if (!d->ok) {
-        MessageBoxW(g.hwnd, L"The rotation could not be saved.", L"Photo Gallery",
+        MessageBoxW(g.hwnd, L"The rotation could not be saved.", L"Media Gallery",
                     MB_OK | MB_ICONWARNING);
     }
     if (g.cur >= 0 && g.files[g.cur] == d->path) {
@@ -1975,7 +1975,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     std::wstring m = L"Save the rotation to \"";
                     m += PathFindFileNameW(path.c_str());
                     m += L"\" before closing?";
-                    if (MessageBoxW(hwnd, m.c_str(), L"Photo Gallery",
+                    if (MessageBoxW(hwnd, m.c_str(), L"Media Gallery",
                                     MB_YESNO | MB_ICONQUESTION) == IDYES) {
                         HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
                         dec->SaveRotation(path, g.rot);
@@ -2032,12 +2032,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wc.lpszMenuName = MAKEINTRESOURCEW(IDR_MAINMENU);
-    wc.lpszClassName = L"PhotoGalleryWnd";
+    wc.lpszClassName = L"MediaGalleryWnd";
     if (!RegisterClassExW(&wc)) return 1;
 
     // WS_CLIPCHILDREN: Paint() BitBlts the whole client; without it every
     // repaint would stomp the D3D video child.
-    g.hwnd = CreateWindowExW(0, wc.lpszClassName, L"Photo Gallery",
+    g.hwnd = CreateWindowExW(0, wc.lpszClassName, L"Media Gallery",
                              WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                              CW_USEDEFAULT, CW_USEDEFAULT,
                              1100, 800, nullptr, nullptr, hInst, nullptr);
@@ -2054,7 +2054,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     vc.hInstance = hInst;
     vc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     vc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
-    vc.lpszClassName = L"PhotoGalleryVideo";
+    vc.lpszClassName = L"MediaGalleryVideo";
     if (RegisterClassExW(&vc))
         g.videoWnd = CreateWindowExW(0, vc.lpszClassName, nullptr, WS_CHILD, 0, 0,
                                      1, 1, g.hwnd, nullptr, hInst, nullptr);

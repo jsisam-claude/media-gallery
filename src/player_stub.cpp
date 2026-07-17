@@ -1,5 +1,5 @@
 // No-op implementation of the video engine API (player.h) for builds
-// without video playback (PHOTOGALLERY_VIDEO=OFF, build.bat, the .vcxproj
+// without video playback (MEDIAGALLERY_VIDEO=OFF, build.bat, the .vcxproj
 // and the MinGW Makefile). player_create() returns null, which the app
 // treats as "video files are not supported" — same behavior as before the
 // engine existed, with no #ifdef in the gallery code.

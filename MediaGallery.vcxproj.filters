@@ -43,7 +43,7 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="src\PhotoGallery.rc">
+    <ResourceCompile Include="src\MediaGallery.rc">
       <Filter>Resource Files</Filter>
     </ResourceCompile>
   </ItemGroup>

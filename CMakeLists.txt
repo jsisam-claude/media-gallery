@@ -1,4 +1,4 @@
-# Photo Gallery — minimal Windows photo viewer (WinAPI + GDI+/WIC) with
+# Media Gallery — minimal Windows photo viewer (WinAPI + GDI+/WIC) with
 # optional video playback (vendored player engine + FFmpeg, see
 # third_party/ and BUILDING.md).
 #
@@ -6,15 +6,15 @@
 #   cmake --preset x64-release          (from an x64 Native Tools prompt)
 #   cmake --build --preset x64-release
 cmake_minimum_required(VERSION 3.24)
-project(PhotoGallery LANGUAGES C CXX)
+project(MediaGallery LANGUAGES C CXX)
 
 # Video playback compiles the vendored FFmpeg + player engine (MSVC only:
 # the committed FFmpeg config in third_party/ffmpeg-config is harvested
 # from an MSVC win64 configure). OFF builds the image-only viewer with
 # src/player_stub.cpp — same behavior as every non-CMake build route.
-option(PHOTOGALLERY_VIDEO "Build with video playback (MSVC only)" ON)
+option(MEDIAGALLERY_VIDEO "Build with video playback (MSVC only)" ON)
 if(NOT MSVC)
-    set(PHOTOGALLERY_VIDEO OFF)
+    set(MEDIAGALLERY_VIDEO OFF)
 endif()
 
 if(MSVC)
@@ -31,36 +31,36 @@ if(MSVC)
     endif()
 endif()
 
-add_executable(PhotoGallery WIN32
+add_executable(MediaGallery WIN32
     src/main.cpp
     src/decoder_gdiplus.cpp
     src/decoder_wic.cpp
     src/filmstrip.cpp
-    src/PhotoGallery.rc
+    src/MediaGallery.rc
 )
 
-set_target_properties(PhotoGallery PROPERTIES
+set_target_properties(MediaGallery PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
 )
 
-target_compile_definitions(PhotoGallery PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
+target_compile_definitions(MediaGallery PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0A00 WINVER=0x0A00)
 
 if(MSVC)
     # Hardened, static-CRT release binary; /W4 warnings.
-    target_compile_options(PhotoGallery PRIVATE /W4 /EHsc /guard:cf)
-    target_link_options(PhotoGallery PRIVATE /DYNAMICBASE /NXCOMPAT /guard:cf /MANIFEST:NO)
+    target_compile_options(MediaGallery PRIVATE /W4 /EHsc /guard:cf)
+    target_link_options(MediaGallery PRIVATE /DYNAMICBASE /NXCOMPAT /guard:cf /MANIFEST:NO)
 else()
     # clang/mingw
-    target_compile_options(PhotoGallery PRIVATE -Wall -Wextra -municode)
-    target_link_options(PhotoGallery PRIVATE -municode -mwindows -static)
+    target_compile_options(MediaGallery PRIVATE -Wall -Wextra -municode)
+    target_link_options(MediaGallery PRIVATE -municode -mwindows -static)
 endif()
 
-target_link_libraries(PhotoGallery PRIVATE
+target_link_libraries(MediaGallery PRIVATE
     gdiplus windowscodecs shlwapi shell32 ole32 oleaut32 uuid comdlg32 gdi32 user32
 )
 
-if(PHOTOGALLERY_VIDEO)
+if(MEDIAGALLERY_VIDEO)
     # Vendored FFmpeg, compiled by this toolchain from source text only —
     # see cmake/ffmpeg.cmake (copied verbatim from the player repo).
     include(cmake/ffmpeg.cmake)
@@ -92,7 +92,7 @@ if(PHOTOGALLERY_VIDEO)
         PUBLIC d3d11 dxgi d3dcompiler d2d1 dwrite windowscodecs ole32 avrt winmm user32
     )
 
-    target_link_libraries(PhotoGallery PRIVATE player_engine)
+    target_link_libraries(MediaGallery PRIVATE player_engine)
 
     # The shell's version resource is a configure_file template upstream;
     # stamp the vendored player version (third_party/player-shell/VERSION)
@@ -122,6 +122,6 @@ if(PHOTOGALLERY_VIDEO)
         shell32 gdi32 comctl32 comdlg32 shlwapi dwmapi
     )
 else()
-    target_sources(PhotoGallery PRIVATE src/player_stub.cpp)
-    target_include_directories(PhotoGallery PRIVATE third_party/player-engine)
+    target_sources(MediaGallery PRIVATE src/player_stub.cpp)
+    target_include_directories(MediaGallery PRIVATE third_party/player-engine)
 endif()
