@@ -1317,6 +1317,23 @@ void OpenTarget(const wchar_t* rawPath) {
         AdoptFileList({}, 0);
         StartListThread(path, true);
     } else {
+        // A video file that the engine can't play: say why, rather than a
+        // generic "not supported". In an image-only build (opened via the
+        // .sln / build.bat / MinGW) player_video_init_error() reports that
+        // video wasn't compiled in; in a video build it reports the D3D
+        // initialization failure.
+        if (IsVideoFile(path) && !IsPlayableVideo(path)) {
+            std::wstring msg = L"This copy of Media Gallery can't play video.\n\n";
+            msg += player_video_init_error();
+            msg += L"\n\nVideo playback is compiled only by the CMake build:\n"
+                   L"    cmake --preset x64-release\n"
+                   L"    cmake --build --preset x64-release\n\n"
+                   L"The Visual Studio .sln, build.bat and MinGW builds are "
+                   L"image-only by design. See BUILDING.md.";
+            MessageBoxW(g.hwnd, msg.c_str(), L"Media Gallery",
+                        MB_OK | MB_ICONINFORMATION);
+            return;
+        }
         if (!IsSupportedImage(path) && !IsPlayableVideo(path)) {
             MessageBoxW(g.hwnd, L"This file type is not supported.", L"Media Gallery",
                         MB_OK | MB_ICONINFORMATION);
