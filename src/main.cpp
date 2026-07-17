@@ -16,6 +16,7 @@
 #include <deque>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "decoder.h"
@@ -377,7 +378,6 @@ struct App {
     unsigned playerGen = 0;        // open generation; drops stale engine events
     bool videoMode = false;        // current item plays in the engine
     bool videoEnded = false;       // playback reached end of media
-    bool videoAdvance = false;     // auto-advance to the next item on end
     bool videoProbed = false;      // videoInfo holds data for the current item
     PlayerMediaInfo videoInfo{};   // filled by the worker thread via WM_APP_PROBED
 
@@ -661,6 +661,41 @@ int GridHitTest(POINT pt, const GridLayout& gl) {
     return (idx < (int)g.files.size()) ? idx : -1;
 }
 
+// Small shell/type icon for a file, cached by lowercase extension. Looked up by
+// attribute (SHGFI_USEFILEATTRIBUTES) so it never touches disk and one icon
+// serves every file of a type. Drawn as a bottom-right badge over thumbnails so
+// the file kind stays visible even when the content thumbnail looks generic.
+HICON TypeIconFor(const std::wstring& path) {
+    static std::unordered_map<std::wstring, HICON> cache; // by lowercase extension
+    std::wstring ext;
+    size_t dot = path.find_last_of(L'.');
+    if (dot != std::wstring::npos) ext = path.substr(dot);
+    if (!ext.empty()) CharLowerBuffW(&ext[0], (DWORD)ext.size());
+    auto it = cache.find(ext);
+    if (it != cache.end()) return it->second;
+    SHFILEINFOW sfi{};
+    HICON icon = nullptr;
+    if (SHGetFileInfoW(path.c_str(), FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi),
+                       SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES))
+        icon = sfi.hIcon; // owned; bounded by distinct-extension count, freed at exit
+    cache[ext] = icon;
+    return icon;
+}
+
+// Overlay the file-type icon in the bottom-right of a thumbnail, sized to ~15%
+// of its width (clamped so it stays legible on tiny cells and modest on large).
+void DrawTypeBadge(HDC dc, const std::wstring& path, int tx, int ty, int tw, int th) {
+    HICON icon = TypeIconFor(path);
+    if (!icon) return;
+    int bw = (std::max)(Scaled(12), (int)(tw * 0.15 + 0.5));
+    bw = (std::min)(bw, (std::min)(tw, th));
+    if (bw <= 0) return;
+    int margin = (std::max)(1, bw / 8);
+    int bx = tx + tw - bw - margin;
+    int by = ty + th - bw - margin;
+    DrawIconEx(dc, bx, by, icon, bw, bw, 0, nullptr, DI_NORMAL);
+}
+
 void PaintGrid(HDC dc, const RECT& client) {
     GridLayout gl = ComputeGrid(client);
     if (g.files.empty()) {
@@ -687,16 +722,17 @@ void PaintGrid(HDC dc, const RECT& client) {
             if (!g.strip.GetThumb(path, thumbClass))
                 g.strip.Request(path, thumbClass);
             HBITMAP thumb = g.strip.GetThumbAny(path);
+            const int cw = cellRc.right - cellRc.left;
+            const int chh = cellRc.bottom - cellRc.top;
+            int tx = cellRc.left, ty = cellRc.top, tw = cw, th = chh;
             if (thumb) {
                 BITMAP bm{};
                 GetObjectW(thumb, sizeof(bm), &bm);
-                const int cw = cellRc.right - cellRc.left;
-                const int chh = cellRc.bottom - cellRc.top;
                 double s = (std::min)((double)cw / bm.bmWidth, (double)chh / bm.bmHeight);
-                int tw = (std::max)(1, (int)(bm.bmWidth * s));
-                int th = (std::max)(1, (int)(bm.bmHeight * s));
-                int tx = cellRc.left + (cw - tw) / 2;
-                int ty = cellRc.top + (chh - th) / 2;
+                tw = (std::max)(1, (int)(bm.bmWidth * s));
+                th = (std::max)(1, (int)(bm.bmHeight * s));
+                tx = cellRc.left + (cw - tw) / 2;
+                ty = cellRc.top + (chh - th) / 2;
                 HGDIOBJ old = SelectObject(mem, thumb);
                 SetStretchBltMode(dc, HALFTONE);
                 SetBrushOrgEx(dc, 0, 0, nullptr);
@@ -707,6 +743,8 @@ void PaintGrid(HDC dc, const RECT& client) {
                 FillRect(dc, &cellRc, ph);
                 DeleteObject(ph);
             }
+            // File-type badge over the thumbnail's bottom-right corner.
+            DrawTypeBadge(dc, path, tx, ty, tw, th);
 
             if (i == g.gridSel) {
                 HBRUSH hl = CreateSolidBrush(kAccent);
@@ -1605,9 +1643,10 @@ void OnPlayerMessage(WPARAM evt, LPARAM gen) {
             break; // duration/position are valid now; repaint below
         case PLAYER_EVT_ENDED:
             g.videoEnded = true;
-            if ((g.videoAdvance || g.slideshow) && g.files.size() > 1) {
-                if (g.slideshow) SlideshowAdvance(); // shuffle-aware
-                else NavigateTo(g.cur + 1);          // auto-advance (opt-in)
+            // A finished video stays put on its last frame; we never auto-advance
+            // to the next item. Only an explicit slideshow cycles through media.
+            if (g.slideshow && g.files.size() > 1) {
+                SlideshowAdvance(); // shuffle-aware
                 return;
             }
             break;
@@ -1733,9 +1772,6 @@ void OnCommand(WORD id) {
         case IDM_SEEK_BACK:
             if (!g.gridMode) VideoSeekBy(-10);
             break;
-        case IDM_VIDEO_ADVANCE:
-            g.videoAdvance = !g.videoAdvance;
-            break;
         case IDM_SLIDESHOW: ToggleSlideshow(); break;
         case IDM_SS_2S:
         case IDM_SS_5S:
@@ -1776,7 +1812,6 @@ void OnInitMenuPopup(HMENU menu) {
     enable(IDM_PLAYPAUSE, video);
     enable(IDM_SEEK_FWD, video);
     enable(IDM_SEEK_BACK, video);
-    enable(IDM_VIDEO_ADVANCE, g.player != nullptr);
     enable(IDM_SLIDESHOW, haveAny);
     CheckMenuItem(menu, IDM_SLIDESHOW,
                   MF_BYCOMMAND | (g.slideshow ? MF_CHECKED : MF_UNCHECKED));
@@ -1785,8 +1820,6 @@ void OnInitMenuPopup(HMENU menu) {
     CheckMenuRadioItem(menu, IDM_SS_2S, IDM_SS_10S, dwell, MF_BYCOMMAND);
     CheckMenuItem(menu, IDM_SS_SHUFFLE,
                   MF_BYCOMMAND | (g.slideshowShuffle ? MF_CHECKED : MF_UNCHECKED));
-    CheckMenuItem(menu, IDM_VIDEO_ADVANCE,
-                  MF_BYCOMMAND | (g.videoAdvance ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_DETAILS,
                   MF_BYCOMMAND | (g.showDetails ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_FILMSTRIP,

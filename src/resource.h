@@ -23,7 +23,6 @@
 #define IDM_PLAYPAUSE       40018
 #define IDM_SEEK_FWD        40019
 #define IDM_SEEK_BACK       40020
-#define IDM_VIDEO_ADVANCE   40021
 #define IDM_SLIDESHOW       40022
 #define IDM_SS_2S           40023 // interval radio group; keep IDs contiguous
 #define IDM_SS_5S           40024
