@@ -1269,7 +1269,9 @@ void LoadCurrent() {
 // Offer to persist an unsaved rotation before leaving the image.
 void MaybeCommitRotation() {
     if (g.rot == 0 || !g.disp || g.cur < 0) return;
-    const std::wstring& path = g.files[g.cur];
+    // By value: MessageBoxW below pumps a modal loop, during which a folder
+    // scan's WM_APP_LIST can replace g.files and free the referenced string.
+    const std::wstring path = g.files[g.cur];
     ImageDecoder* dec = FindDecoder(path);
     if (dec && dec->CanSaveRotation(path, *g.disp)) {
         std::wstring msg = L"Save the rotation to \"";
@@ -1490,6 +1492,18 @@ void DeleteAt(int index) {
     op->Release();
     if (!deleted) {
         if (closedVideo) LoadCurrent(); // reopen the video we closed above
+        return;
+    }
+
+    // PerformOperations() pumps a modal shell dialog, during which a folder
+    // scan's WM_APP_LIST can replace g.files (and g.cur). Re-resolve the row
+    // to erase by path so we never index the stale/old vector out of bounds.
+    index = -1;
+    for (int i = 0; i < (int)g.files.size(); ++i)
+        if (lstrcmpiW(g.files[i].c_str(), path.c_str()) == 0) { index = i; break; }
+    if (index < 0) {
+        // Already absent from the current listing (the scan dropped it too).
+        if (closedVideo) LoadCurrent();
         return;
     }
 
@@ -2019,7 +2033,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_CLOSE:
             // Last chance to persist an unsaved rotation (synchronous: we're exiting).
             if (g.rot != 0 && g.disp && g.cur >= 0) {
-                const std::wstring& path = g.files[g.cur];
+                // By value: MessageBoxW pumps a modal loop that can deliver a
+                // WM_APP_LIST and free the string this would otherwise alias.
+                const std::wstring path = g.files[g.cur];
                 ImageDecoder* dec = FindDecoder(path);
                 if (dec && dec->CanSaveRotation(path, *g.disp)) {
                     std::wstring m = L"Save the rotation to \"";

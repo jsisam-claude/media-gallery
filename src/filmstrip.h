@@ -5,6 +5,7 @@
 #pragma once
 #include <windows.h>
 
+#include <cstdint>
 #include <deque>
 #include <string>
 #include <unordered_map>
@@ -24,7 +25,9 @@ public:
     struct ThumbResult {
         std::wstring path;
         int px;
-        HBITMAP bmp; // may be null (load failed)
+        HBITMAP bmp;   // may be null (load failed)
+        uint64_t gen;  // request epoch; a result older than the key's last
+                       // invalidation is discarded instead of re-cached
     };
     void OnThumbReady(ThumbResult* r); // takes ownership; call from UI thread
 
@@ -58,12 +61,17 @@ private:
 
     std::unordered_map<std::wstring, HBITMAP> cache_; // null value = failed load
     std::unordered_map<std::wstring, bool> requested_;
+    // Per-key epoch of the last InvalidateThumb; a result whose request epoch
+    // is older is stale (the file changed mid-generation) and is discarded.
+    std::unordered_map<std::wstring, uint64_t> invalidatedGen_;
+    uint64_t gen_ = 1; // monotonic request epoch (UI thread only)
 
     HWND owner_ = nullptr;
     UINT readyMsg_ = 0;
     HANDLE thread_ = nullptr;
     CRITICAL_SECTION cs_{};
     CONDITION_VARIABLE cv_{};
-    std::deque<std::pair<std::wstring, int>> queue_;
+    struct QueuedThumb { std::wstring path; int px; uint64_t gen; };
+    std::deque<QueuedThumb> queue_;
     bool quit_ = false;
 };

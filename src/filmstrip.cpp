@@ -156,14 +156,15 @@ void Filmstrip::WorkerLoop() {
             LeaveCriticalSection(&cs_);
             break;
         }
-        std::wstring path = std::move(queue_.front().first);
-        int px = queue_.front().second;
+        std::wstring path = std::move(queue_.front().path);
+        int px = queue_.front().px;
+        uint64_t gen = queue_.front().gen;
         queue_.pop_front();
         LeaveCriticalSection(&cs_);
 
         HBITMAP hbmp = IsVideoFile(path) ? ThumbFromVideo(path, px) : nullptr;
         if (!hbmp) hbmp = LoadShellThumb(path, px);
-        auto* r = new ThumbResult{std::move(path), px, hbmp};
+        auto* r = new ThumbResult{std::move(path), px, hbmp, gen};
         if (!PostMessageW(owner_, readyMsg_, 0, reinterpret_cast<LPARAM>(r))) {
             if (r->bmp) DeleteObject(r->bmp);
             delete r;
@@ -184,6 +185,7 @@ void Filmstrip::SetCurrent(int index) {
 }
 
 void Filmstrip::InvalidateThumb(const std::wstring& path) {
+    ++gen_;  // any request already in flight for these keys is now stale
     for (int s : kSizes) {
         const std::wstring key = Key(path, s);
         auto it = cache_.find(key);
@@ -192,12 +194,21 @@ void Filmstrip::InvalidateThumb(const std::wstring& path) {
             cache_.erase(it);
         }
         requested_.erase(key);
+        invalidatedGen_[key] = gen_;
     }
 }
 
 void Filmstrip::OnThumbReady(ThumbResult* r) {
-    EvictIfNeeded();
     const std::wstring key = Key(r->path, r->px);
+    // Discard a thumbnail that was requested before the last invalidation of
+    // this key: the file changed mid-generation, so this bitmap is outdated.
+    auto inv = invalidatedGen_.find(key);
+    if (inv != invalidatedGen_.end() && r->gen < inv->second) {
+        if (r->bmp) DeleteObject(r->bmp);
+        delete r;
+        return;
+    }
+    EvictIfNeeded();
     auto it = cache_.find(key);
     if (it != cache_.end() && it->second) DeleteObject(it->second);
     cache_[key] = r->bmp; // may be null: remembered as failed, no re-request
@@ -223,6 +234,7 @@ void Filmstrip::EvictIfNeeded() {
         if (kv.second) DeleteObject(kv.second);
     cache_.clear(); // thumbnails reload lazily; trivially correct eviction
     requested_.clear();
+    invalidatedGen_.clear(); // keys are gone; their stale-guards are moot
 }
 
 void Filmstrip::Request(const std::wstring& path, int px) {
@@ -230,7 +242,7 @@ void Filmstrip::Request(const std::wstring& path, int px) {
     if (requested_.count(key)) return;
     requested_[key] = true;
     EnterCriticalSection(&cs_);
-    queue_.emplace_back(path, px);
+    queue_.push_back({path, px, gen_});
     LeaveCriticalSection(&cs_);
     WakeConditionVariable(&cv_);
 }
