@@ -1920,12 +1920,14 @@ void OnListDone(ListDone* d) {
     }
 }
 
-void OnCommand(WORD id) {
+void OnCommand(WORD id, bool fromAccel = false) {
     switch (id) {
         case IDM_OPEN: OpenDialog(); break;
         case IDM_EXIT:
-            if (g.slideshow) StopSlideshow(); // Esc backs out of the slideshow,
-            else if (g.gridMode) ToggleGrid(); // then the grid, before closing
+            // File > Exit (a menu click) always closes; only the Esc
+            // accelerator backs out of the slideshow, then the grid, first.
+            if (fromAccel && g.slideshow) StopSlideshow();
+            else if (fromAccel && g.gridMode) ToggleGrid();
             else PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
             break;
         case IDM_EDIT_PAINT: EditInPaint(g.gridMode ? g.gridSel : g.cur); break;
@@ -2167,7 +2169,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         case WM_COMMAND:
-            OnCommand(LOWORD(wParam));
+            // HIWORD==1 marks an accelerator (Esc); 0 is a menu/button click.
+            OnCommand(LOWORD(wParam), HIWORD(wParam) == 1);
             return 0;
         case WM_INITMENUPOPUP:
             OnInitMenuPopup(reinterpret_cast<HMENU>(wParam));

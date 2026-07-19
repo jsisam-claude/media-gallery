@@ -5,8 +5,8 @@
 #pragma once
 #include <windows.h>
 
-#include <cstdint>
 #include <deque>
+#include <list>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -26,9 +26,8 @@ public:
     struct ThumbResult {
         std::wstring path;
         int px;
-        HBITMAP bmp;   // may be null (load failed)
-        uint64_t gen;  // request epoch; a result older than the key's last
-                       // invalidation is discarded instead of re-cached
+        unsigned gen; // generation at request time; stale results are dropped
+        HBITMAP bmp;  // may be null (load failed)
     };
     void OnThumbReady(ThumbResult* r); // takes ownership; call from UI thread
 
@@ -50,6 +49,13 @@ public:
 private:
     int Pad() const;  // strip padding at the current DPI
     int Gap() const;  // inter-cell gap at the current DPI
+    struct Entry {
+        HBITMAP bmp = nullptr; // null = load failed (remembered, not re-requested)
+        size_t bytes = 0;
+        std::list<std::wstring>::iterator lruIt;
+    };
+    void TouchLru(const std::wstring& key, Entry& e) const;
+    void EvictEntry(const std::wstring& key);
     void EvictIfNeeded();
     static DWORD WINAPI ThreadProc(void* self);
     void WorkerLoop();
@@ -63,19 +69,24 @@ private:
     int scrollX_ = 0;
     bool pendingEnsureVisible_ = false;
 
-    std::unordered_map<std::wstring, HBITMAP> cache_; // null value = failed load
+    // LRU cache bounded by bytes (and entry count as a backstop). mutable so
+    // const lookups can refresh recency; all access is UI-thread only.
+    mutable std::unordered_map<std::wstring, Entry> cache_;
+    mutable std::list<std::wstring> lru_; // front = oldest
+    size_t cacheBytes_ = 0;
     std::unordered_map<std::wstring, bool> requested_;
-    // Per-key epoch of the last InvalidateThumb; a result whose request epoch
-    // is older is stale (the file changed mid-generation) and is discarded.
-    std::unordered_map<std::wstring, uint64_t> invalidatedGen_;
-    uint64_t gen_ = 1; // monotonic request epoch (UI thread only)
+    unsigned gen_ = 0; // bumped by InvalidateThumb; stale worker results dropped
 
+    struct Job {
+        std::wstring path;
+        int px;
+        unsigned gen;
+    };
     HWND owner_ = nullptr;
     UINT readyMsg_ = 0;
     HANDLE thread_ = nullptr;
     CRITICAL_SECTION cs_{};
     CONDITION_VARIABLE cv_{};
-    struct QueuedThumb { std::wstring path; int px; uint64_t gen; };
-    std::deque<QueuedThumb> queue_;
+    std::deque<Job> queue_;
     bool quit_ = false;
 };

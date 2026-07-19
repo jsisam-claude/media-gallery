@@ -359,25 +359,21 @@ bool IsVideoFile(const std::wstring& path) {
 }
 
 std::wstring OpenDialogFilter(bool includeVideo) {
+    // Exact-token dedup — a substring test would drop "*.jpe" (inside "*.jpeg").
+    std::vector<std::wstring> seen;
     std::wstring patterns;
-    for (ImageDecoder* d : g_decoders) {
-        for (const auto& e : d->Extensions()) {
-            std::wstring pat = L"*." + e;
-            if (patterns.find(pat) == std::wstring::npos) {
-                if (!patterns.empty()) patterns += L";";
-                patterns += pat;
-            }
-        }
-    }
-    if (includeVideo) {
-        for (const wchar_t* e : kVideoExts) {
-            std::wstring pat = std::wstring(L"*.") + e;
-            if (patterns.find(pat) == std::wstring::npos) {
-                if (!patterns.empty()) patterns += L";";
-                patterns += pat;
-            }
-        }
-    }
+    auto add = [&](const std::wstring& pat) {
+        if (std::find(seen.begin(), seen.end(), pat) != seen.end()) return;
+        seen.push_back(pat);
+        if (!patterns.empty()) patterns += L";";
+        patterns += pat;
+    };
+    for (ImageDecoder* d : g_decoders)
+        for (const auto& e : d->Extensions())
+            add(L"*." + e);
+    if (includeVideo)
+        for (const wchar_t* e : kVideoExts)
+            add(std::wstring(L"*.") + e);
     std::wstring filter = includeVideo ? L"Images & videos" : L"Images";
     filter += L'\0';
     filter += patterns;

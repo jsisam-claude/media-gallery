@@ -40,16 +40,19 @@ public:
             dec->Release();
             return nullptr;
         }
-        // Extra frames in a WIC container are almost always animation, not
-        // navigable pages (classic multi-page TIFF routes through GDI+, which
-        // is registered first). Don't expose a page bar over animation frames;
-        // multiFrame still guards rotation-save and can note it in details.
-        out->pageCount = 1;
+        // Frames are navigable pages only for paged containers (TIFF); for
+        // animated formats (GIF/WebP/…) they are animation frames, so show the
+        // first and don't expose a page bar. multiFrame still guards
+        // rotation-save and can note it in details.
+        GUID container{};
+        dec->GetContainerFormat(&container);
+        const bool paged = IsEqualGUID(container, GUID_ContainerFormatTiff);
+        out->pageCount = paged ? frames : 1;
         out->multiFrame = frames > 1;
         AddFormatMeta(dec, *out);
 
         IWICBitmapFrameDecode* frame = nullptr;
-        HRESULT hr = dec->GetFrame(0, &frame);
+        HRESULT hr = dec->GetFrame(paged ? (std::min)(page, frames - 1) : 0, &frame);
         dec->Release();
         if (FAILED(hr)) return nullptr;
 
