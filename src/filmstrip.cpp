@@ -12,7 +12,8 @@ namespace {
 constexpr int kBaseHeight = 96; // at 96 dpi
 constexpr int kPad = 6;
 constexpr int kGap = 6;
-constexpr size_t kCacheCap = 512;
+constexpr size_t kCacheBudgetBytes = 256u * 1024 * 1024; // bitmap bytes kept cached
+constexpr size_t kCacheMaxEntries = 4096;                // backstop (incl. failures)
 
 int CellSize(int stripH) { return stripH - 2 * kPad; }
 
@@ -98,8 +99,10 @@ void Filmstrip::Stop() {
     thread_ = nullptr;
     DeleteCriticalSection(&cs_);
     for (auto& kv : cache_)
-        if (kv.second) DeleteObject(kv.second);
+        if (kv.second.bmp) DeleteObject(kv.second.bmp);
     cache_.clear();
+    lru_.clear();
+    cacheBytes_ = 0;
 }
 
 DWORD WINAPI Filmstrip::ThreadProc(void* self) {
@@ -117,13 +120,12 @@ void Filmstrip::WorkerLoop() {
             LeaveCriticalSection(&cs_);
             break;
         }
-        std::wstring path = std::move(queue_.front().first);
-        int px = queue_.front().second;
+        Job job = std::move(queue_.front());
         queue_.pop_front();
         LeaveCriticalSection(&cs_);
 
-        HBITMAP hbmp = LoadShellThumb(path, px);
-        auto* r = new ThumbResult{std::move(path), px, hbmp};
+        HBITMAP hbmp = LoadShellThumb(job.path, job.px);
+        auto* r = new ThumbResult{std::move(job.path), job.px, job.gen, hbmp};
         if (!PostMessageW(owner_, readyMsg_, 0, reinterpret_cast<LPARAM>(r))) {
             if (r->bmp) DeleteObject(r->bmp);
             delete r;
@@ -146,43 +148,80 @@ void Filmstrip::SetCurrent(int index) {
 void Filmstrip::InvalidateThumb(const std::wstring& path) {
     for (int s : kSizes) {
         const std::wstring key = Key(path, s);
-        auto it = cache_.find(key);
-        if (it != cache_.end()) {
-            if (it->second) DeleteObject(it->second);
-            cache_.erase(it);
-        }
+        EvictEntry(key);
         requested_.erase(key);
     }
+    gen_++; // any result still in flight was computed from the old file
+}
+
+void Filmstrip::TouchLru(const std::wstring& key, Entry& e) const {
+    lru_.erase(e.lruIt);
+    lru_.push_back(key);
+    e.lruIt = std::prev(lru_.end());
+}
+
+void Filmstrip::EvictEntry(const std::wstring& key) {
+    auto it = cache_.find(key);
+    if (it == cache_.end()) return;
+    if (it->second.bmp) DeleteObject(it->second.bmp);
+    cacheBytes_ -= it->second.bytes;
+    lru_.erase(it->second.lruIt);
+    cache_.erase(it);
 }
 
 void Filmstrip::OnThumbReady(ThumbResult* r) {
-    EvictIfNeeded();
+    if (r->gen != gen_) {
+        // Computed before an InvalidateThumb: stale. Drop it and clear the
+        // request marker so the next Draw re-requests a fresh one.
+        if (r->bmp) DeleteObject(r->bmp);
+        requested_.erase(Key(r->path, r->px));
+        delete r;
+        return;
+    }
     const std::wstring key = Key(r->path, r->px);
-    auto it = cache_.find(key);
-    if (it != cache_.end() && it->second) DeleteObject(it->second);
-    cache_[key] = r->bmp; // may be null: remembered as failed, no re-request
+    EvictEntry(key);
+    Entry e;
+    e.bmp = r->bmp; // may be null: remembered as failed, no re-request
+    if (r->bmp) {
+        BITMAP bm{};
+        GetObjectW(r->bmp, sizeof(bm), &bm);
+        e.bytes = size_t(bm.bmWidthBytes ? bm.bmWidthBytes : bm.bmWidth * 4) * bm.bmHeight;
+    }
+    lru_.push_back(key);
+    e.lruIt = std::prev(lru_.end());
+    cacheBytes_ += e.bytes;
+    cache_[key] = e;
     delete r;
+    EvictIfNeeded();
 }
 
 HBITMAP Filmstrip::GetThumb(const std::wstring& path, int px) const {
     auto it = cache_.find(Key(path, px));
-    return it != cache_.end() ? it->second : nullptr;
+    if (it == cache_.end()) return nullptr;
+    TouchLru(it->first, it->second);
+    return it->second.bmp;
 }
 
 HBITMAP Filmstrip::GetThumbAny(const std::wstring& path) const {
     for (int i = 2; i >= 0; --i) { // prefer the largest loaded class
         auto it = cache_.find(Key(path, kSizes[i]));
-        if (it != cache_.end() && it->second) return it->second;
+        if (it != cache_.end() && it->second.bmp) {
+            TouchLru(it->first, it->second);
+            return it->second.bmp;
+        }
     }
     return nullptr;
 }
 
 void Filmstrip::EvictIfNeeded() {
-    if (cache_.size() < kCacheCap) return;
-    for (auto& kv : cache_)
-        if (kv.second) DeleteObject(kv.second);
-    cache_.clear(); // thumbnails reload lazily; trivially correct eviction
-    requested_.clear();
+    // Least-recently-used first; anything on screen was just touched by Draw,
+    // so visible thumbnails are never the ones evicted.
+    while ((cacheBytes_ > kCacheBudgetBytes || cache_.size() > kCacheMaxEntries) &&
+           !lru_.empty()) {
+        const std::wstring key = lru_.front();
+        requested_.erase(key); // allow a future re-request
+        EvictEntry(key);
+    }
 }
 
 void Filmstrip::Request(const std::wstring& path, int px) {
@@ -190,7 +229,7 @@ void Filmstrip::Request(const std::wstring& path, int px) {
     if (requested_.count(key)) return;
     requested_[key] = true;
     EnterCriticalSection(&cs_);
-    queue_.emplace_back(path, px);
+    queue_.push_back({path, px, gen_});
     LeaveCriticalSection(&cs_);
     WakeConditionVariable(&cv_);
 }

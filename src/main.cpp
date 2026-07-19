@@ -156,11 +156,12 @@ struct ListReq {
     bool isFolder;
 };
 
+// Not PathRemoveFileSpecW: that would truncate paths longer than MAX_PATH.
 std::wstring ParentDir(const std::wstring& path) {
-    wchar_t buf[MAX_PATH];
-    lstrcpynW(buf, path.c_str(), MAX_PATH);
-    PathRemoveFileSpecW(buf);
-    return buf;
+    size_t pos = path.find_last_of(L"\\/");
+    if (pos == std::wstring::npos) return path;
+    if (pos <= 2) return path.substr(0, pos + 1); // drive root: keep "C:\"
+    return path.substr(0, pos);
 }
 
 // Items of an open Explorer window showing `dir`, in its current display order.
@@ -317,7 +318,7 @@ struct App {
     bool decodePending = false;
     bool decodeFailed = false;
     FILETIME lastWrite{};
-    bool savePending = false;
+    std::vector<std::wstring> pendingSaves; // paths with a queued/in-flight save
 
     bool fitMode = true;
     double zoom = 1.0;
@@ -343,6 +344,12 @@ App g;
 
 std::wstring CacheKey(const std::wstring& path, UINT page) {
     return path + L"|" + std::to_wstring(page);
+}
+
+bool SaveInFlightFor(const std::wstring& path) {
+    for (const auto& p : g.pendingSaves)
+        if (lstrcmpiW(p.c_str(), path.c_str()) == 0) return true;
+    return false;
 }
 
 std::shared_ptr<DecodedImage> CacheGet(const std::wstring& key) {
@@ -546,6 +553,10 @@ void GridEnsureVisible() {
 
 void ToggleGrid() {
     g.gridMode = !g.gridMode;
+    if (g.dragging) { // a viewer pan drag must not keep mutating hidden state
+        g.dragging = false;
+        ReleaseCapture();
+    }
     if (g.gridMode) {
         g.gridSel = (std::max)(0, g.cur);
         GridEnsureVisible();
@@ -657,9 +668,9 @@ UiRects ComputeUiRects(const RECT& imgArea) {
     UiRects r;
     if (g.cur < 0) return r;
     const int btnW = Scaled(44), btnH = Scaled(30), gap = Scaled(6), pad = Scaled(8);
-    const bool canSave = g.rot != 0 && g.disp && !g.savePending &&
-                         FindDecoder(g.files[g.cur]) &&
-                         FindDecoder(g.files[g.cur])->CanSaveRotation(g.files[g.cur], *g.disp);
+    ImageDecoder* dec = FindDecoder(g.files[g.cur]);
+    const bool canSave = g.rot != 0 && g.disp && !SaveInFlightFor(g.files[g.cur]) &&
+                         dec && dec->CanSaveRotation(g.files[g.cur], *g.disp);
     r.saveVisible = canSave;
     const int saveW = canSave ? Scaled(64) + gap : 0;
     const int barW = 2 * btnW + gap + saveW + 2 * pad;
@@ -965,16 +976,18 @@ void LoadCurrent() {
 // Offer to persist an unsaved rotation before leaving the image.
 void MaybeCommitRotation() {
     if (g.rot == 0 || !g.disp || g.cur < 0) return;
-    const std::wstring& path = g.files[g.cur];
+    // Copy, don't reference: the modal below pumps messages that can mutate g.files.
+    const std::wstring path = g.files[g.cur];
+    const int rot = g.rot;
     ImageDecoder* dec = FindDecoder(path);
-    if (dec && dec->CanSaveRotation(path, *g.disp)) {
+    if (dec && dec->CanSaveRotation(path, *g.disp) && !SaveInFlightFor(path)) {
         std::wstring msg = L"Save the rotation to \"";
         msg += PathFindFileNameW(path.c_str());
         msg += L"\"?";
         if (MessageBoxW(g.hwnd, msg.c_str(), L"Photo Gallery",
                         MB_YESNO | MB_ICONQUESTION) == IDYES) {
-            g.savePending = true;
-            g.worker.RequestSave(path, g.rot);
+            g.pendingSaves.push_back(path);
+            g.worker.RequestSave(path, rot);
         }
     }
     g.rot = 0;
@@ -982,10 +995,14 @@ void MaybeCommitRotation() {
 
 void NavigateTo(int index, bool resetPage = true) {
     if (g.files.empty()) return;
+    MaybeCommitRotation(); // may pump messages; g.files can change size here
+    if (g.files.empty()) {
+        g.cur = -1;
+        LoadCurrent();
+        return;
+    }
     const int n = (int)g.files.size();
-    index = ((index % n) + n) % n;
-    MaybeCommitRotation();
-    g.cur = index;
+    g.cur = ((index % n) + n) % n;
     if (resetPage) g.page = 0;
     g.rot = 0;
     g.fitMode = true;
@@ -1032,10 +1049,12 @@ void StartListThread(const std::wstring& target, bool isFolder) {
     g.listPending = true;
     auto* req = new ListReq{g.hwnd, g.listGen, target, isFolder};
     HANDLE h = CreateThread(nullptr, 0, ListThreadProc, req, 0, nullptr);
-    if (h)
+    if (h) {
         CloseHandle(h);
-    else
+    } else {
         delete req;
+        g.listPending = false; // no WM_APP_LIST will ever arrive for this scan
+    }
 }
 
 // Open a file or folder (command line, Ctrl+O, or drag & drop).
@@ -1126,7 +1145,7 @@ void RotateView(int delta) {
 }
 
 void SaveRotationNow() {
-    if (g.rot == 0 || !g.disp || g.cur < 0 || g.savePending) return;
+    if (g.rot == 0 || !g.disp || g.cur < 0 || SaveInFlightFor(g.files[g.cur])) return;
     const std::wstring& path = g.files[g.cur];
     ImageDecoder* dec = FindDecoder(path);
     if (!dec || !dec->CanSaveRotation(path, *g.disp)) {
@@ -1134,7 +1153,7 @@ void SaveRotationNow() {
                     MB_OK | MB_ICONINFORMATION);
         return;
     }
-    g.savePending = true;
+    g.pendingSaves.push_back(path);
     g.worker.RequestSave(path, g.rot);
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
@@ -1166,6 +1185,17 @@ void DeleteAt(int index) {
 
     CacheRemovePath(path);
     g.strip.InvalidateThumb(path);
+    // The confirmation dialog pumped messages; g.files may have been replaced
+    // (e.g. a pending folder scan landed). Re-resolve the index by path.
+    auto it = std::find_if(g.files.begin(), g.files.end(), [&](const std::wstring& f) {
+        return lstrcmpiW(f.c_str(), path.c_str()) == 0;
+    });
+    if (it == g.files.end()) {
+        UpdateTitle();
+        InvalidateRect(g.hwnd, nullptr, FALSE);
+        return; // already gone from the (new) list
+    }
+    index = (int)(it - g.files.begin());
     if (index == g.cur) g.rot = 0;
     g.files.erase(g.files.begin() + index);
     if (g.files.empty()) {
@@ -1183,6 +1213,8 @@ void DeleteAt(int index) {
         g.page = 0;
         g.fitMode = true;
         LoadCurrent();
+    } else {
+        UpdateTitle(); // count in the title shrank even though g.cur is unchanged
     }
     g.gridSel = (std::max)(0, (std::min)(index, (int)g.files.size() - 1));
     if (g.gridMode) GridEnsureVisible();
@@ -1278,7 +1310,12 @@ void OnDecoded(DecodeDone* d) {
 
 void OnSaved(SaveDone* d) {
     std::unique_ptr<SaveDone> owner(d);
-    g.savePending = false;
+    for (size_t i = 0; i < g.pendingSaves.size(); ++i) {
+        if (lstrcmpiW(g.pendingSaves[i].c_str(), d->path.c_str()) == 0) {
+            g.pendingSaves.erase(g.pendingSaves.begin() + i);
+            break;
+        }
+    }
     CacheRemovePath(d->path);
     g.strip.InvalidateThumb(d->path);
     if (!d->ok) {
@@ -1334,11 +1371,13 @@ void OnListDone(ListDone* d) {
     }
 }
 
-void OnCommand(WORD id) {
+void OnCommand(WORD id, bool fromAccel) {
     switch (id) {
         case IDM_OPEN: OpenDialog(); break;
         case IDM_EXIT:
-            if (g.gridMode) ToggleGrid(); // Esc backs out of the grid first
+            // Only the Esc accelerator backs out of the grid; the File > Exit
+            // menu item always closes the app.
+            if (g.gridMode && fromAccel) ToggleGrid();
             else PostMessageW(g.hwnd, WM_CLOSE, 0, 0);
             break;
         case IDM_EDIT_PAINT: EditInPaint(g.gridMode ? g.gridSel : g.cur); break;
@@ -1353,10 +1392,12 @@ void OnCommand(WORD id) {
             if (!g.gridMode) SaveRotationNow();
             break;
         case IDM_DETAILS:
+            if (g.gridMode) break; // no visible effect in grid view
             g.showDetails = !g.showDetails;
             InvalidateRect(g.hwnd, nullptr, FALSE);
             break;
         case IDM_FILMSTRIP:
+            if (g.gridMode) break;
             g.showFilmstrip = !g.showFilmstrip;
             InvalidateRect(g.hwnd, nullptr, FALSE);
             break;
@@ -1406,7 +1447,8 @@ void OnInitMenuPopup(HMENU menu) {
     enable(IDM_DELETE, g.gridMode ? haveAny : haveImage);
     enable(IDM_ROTATE_CW, haveDisp && !g.gridMode);
     enable(IDM_ROTATE_CCW, haveDisp && !g.gridMode);
-    enable(IDM_SAVE, haveDisp && !g.gridMode && g.rot != 0 && !g.savePending);
+    enable(IDM_SAVE, haveDisp && !g.gridMode && g.rot != 0 && haveImage &&
+                         !SaveInFlightFor(g.files[g.cur]));
     enable(IDM_ZOOMIN, g.gridMode || haveDisp);
     enable(IDM_ZOOMOUT, g.gridMode || haveDisp);
     enable(IDM_FIT, haveDisp && !g.gridMode);
@@ -1414,6 +1456,8 @@ void OnInitMenuPopup(HMENU menu) {
     enable(IDM_PREV, g.files.size() > 1);
     enable(IDM_PAGE_NEXT, g.gridMode ? haveAny : (haveDisp && g.disp->pageCount > 1));
     enable(IDM_PAGE_PREV, g.gridMode ? haveAny : (haveDisp && g.disp->pageCount > 1));
+    enable(IDM_DETAILS, !g.gridMode);
+    enable(IDM_FILMSTRIP, !g.gridMode);
     CheckMenuItem(menu, IDM_DETAILS,
                   MF_BYCOMMAND | (g.showDetails ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, IDM_FILMSTRIP,
@@ -1512,7 +1556,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         case WM_COMMAND:
-            OnCommand(LOWORD(wParam));
+            OnCommand(LOWORD(wParam), HIWORD(wParam) == 1);
             return 0;
         case WM_INITMENUPOPUP:
             OnInitMenuPopup(reinterpret_cast<HMENU>(wParam));
@@ -1578,8 +1622,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         case WM_CLOSE:
             // Last chance to persist an unsaved rotation (synchronous: we're exiting).
-            if (g.rot != 0 && g.disp && g.cur >= 0) {
-                const std::wstring& path = g.files[g.cur];
+            // Skipped when a save for this file is already queued on the worker —
+            // a second, concurrent writer would race it on the same temp file.
+            if (g.rot != 0 && g.disp && g.cur >= 0 && !SaveInFlightFor(g.files[g.cur])) {
+                const std::wstring path = g.files[g.cur];
                 ImageDecoder* dec = FindDecoder(path);
                 if (dec && dec->CanSaveRotation(path, *g.disp)) {
                     std::wstring m = L"Save the rotation to \"";

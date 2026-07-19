@@ -333,11 +333,14 @@ ImageDecoder* FindDecoder(const std::wstring& path) {
 bool IsSupportedImage(const std::wstring& path) { return FindDecoder(path) != nullptr; }
 
 std::wstring OpenDialogFilter() {
+    // Exact-token dedup — a substring test would drop "*.jpe" (inside "*.jpeg").
+    std::vector<std::wstring> seen;
     std::wstring patterns;
     for (ImageDecoder* d : g_decoders) {
         for (const auto& e : d->Extensions()) {
             std::wstring pat = L"*." + e;
-            if (patterns.find(pat) == std::wstring::npos) {
+            if (std::find(seen.begin(), seen.end(), pat) == seen.end()) {
+                seen.push_back(pat);
                 if (!patterns.empty()) patterns += L";";
                 patterns += pat;
             }

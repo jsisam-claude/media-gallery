@@ -25,6 +25,11 @@ class ImageDecoder {
 public:
     virtual ~ImageDecoder() = default;
     virtual const std::vector<std::wstring>& Extensions() const = 0; // lowercase, no dot
+    // Contract: returned pixels must have any EXIF/container orientation already
+    // applied ("baked in") — the app never re-orients. SaveRotation implementations
+    // must compose with a still-present orientation tag accordingly.
+    // pageCount counts navigable document pages only (e.g. TIFF); animation
+    // frames set multiFrame but leave pageCount at 1.
     virtual std::unique_ptr<DecodedImage> Load(const std::wstring& path, UINT page) const = 0;
     // Persisting a rotation is an optional capability (quarterTurns 1..3, clockwise).
     virtual bool CanSaveRotation(const std::wstring&, const DecodedImage&) const { return false; }

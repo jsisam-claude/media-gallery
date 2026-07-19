@@ -4,11 +4,40 @@
 // Registered after the GDI+ decoder, which keeps the classic formats.
 #include "decoder.h"
 
+#include <propvarutil.h>
 #include <wincodec.h>
 
 #include <algorithm>
 
 namespace {
+
+// EXIF orientation (1..8) -> WIC transform. WIC applies the flip before the
+// rotation, so e.g. Rotate270|FlipH here equals GDI+'s Rotate90FlipX.
+WICBitmapTransformOptions OrientationTransform(IWICBitmapFrameDecode* frame) {
+    WICBitmapTransformOptions t = WICBitmapTransformRotate0;
+    IWICMetadataQueryReader* mr = nullptr;
+    if (FAILED(frame->GetMetadataQueryReader(&mr))) return t;
+    PROPVARIANT v;
+    PropVariantInit(&v);
+    if (SUCCEEDED(mr->GetMetadataByName(L"System.Photo.Orientation", &v)) &&
+        v.vt == VT_UI2) {
+        switch (v.uiVal) {
+            case 2: t = WICBitmapTransformFlipHorizontal; break;
+            case 3: t = WICBitmapTransformRotate180; break;
+            case 4: t = WICBitmapTransformFlipVertical; break;
+            case 5: t = (WICBitmapTransformOptions)(WICBitmapTransformRotate270 |
+                                                    WICBitmapTransformFlipHorizontal); break;
+            case 6: t = WICBitmapTransformRotate90; break;
+            case 7: t = (WICBitmapTransformOptions)(WICBitmapTransformRotate90 |
+                                                    WICBitmapTransformFlipHorizontal); break;
+            case 8: t = WICBitmapTransformRotate270; break;
+            default: break;
+        }
+    }
+    PropVariantClear(&v);
+    mr->Release();
+    return t;
+}
 
 class WicDecoder final : public ImageDecoder {
 public:
@@ -39,17 +68,37 @@ public:
             dec->Release();
             return nullptr;
         }
-        out->pageCount = frames;
+        // Frames are navigable pages only for paged containers (TIFF); for
+        // animated formats (GIF/WebP/...) they are animation frames — show the
+        // first, like the GDI+ path does for GIF.
+        GUID container{};
+        dec->GetContainerFormat(&container);
+        const bool paged = IsEqualGUID(container, GUID_ContainerFormatTiff);
+        out->pageCount = paged ? frames : 1;
         out->multiFrame = frames > 1;
         AddFormatMeta(dec, *out);
 
         IWICBitmapFrameDecode* frame = nullptr;
-        HRESULT hr = dec->GetFrame((std::min)(page, frames - 1), &frame);
+        HRESULT hr = dec->GetFrame(paged ? (std::min)(page, frames - 1) : 0, &frame);
         dec->Release();
         if (FAILED(hr)) return nullptr;
 
+        // Bake EXIF orientation into the pixels, matching the GDI+ decoder.
+        IWICBitmapSource* oriented = frame;
+        WICBitmapTransformOptions t = OrientationTransform(frame);
+        if (t != WICBitmapTransformRotate0) {
+            IWICBitmapFlipRotator* rot = nullptr;
+            if (SUCCEEDED(factory_->CreateBitmapFlipRotator(&rot)) &&
+                SUCCEEDED(rot->Initialize(frame, t))) {
+                oriented = rot; // owns a ref on frame
+            } else if (rot) {
+                rot->Release();
+            }
+        }
+
         IWICBitmapSource* src = nullptr;
-        hr = WICConvertBitmapSource(GUID_WICPixelFormat32bppBGRA, frame, &src);
+        hr = WICConvertBitmapSource(GUID_WICPixelFormat32bppBGRA, oriented, &src);
+        if (oriented != frame) oriented->Release();
         frame->Release();
         if (FAILED(hr)) return nullptr;
 
