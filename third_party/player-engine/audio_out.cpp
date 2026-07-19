@@ -414,7 +414,6 @@ bool AudioOut::run_device() {
 
     double queued_pts = NAN;  // pts at the *end* of everything pushed into fifo
     bool client_started = false;
-    bool ever_started = false;  // client has run at least once (past first start)
     bool device_paused = false;
     bool lost = false;
     HRESULT hr;
@@ -432,12 +431,19 @@ bool AudioOut::run_device() {
             queued_pts = NAN;
             // Also discard what already reached the device: without a Reset,
             // up to ~200ms of pre-seek audio keeps playing after every seek.
+            // Reset requires a stopped client; restart it right away (unless
+            // we're paused) so the loop keeps feeding it — leaving it stopped
+            // and waiting to restart on the first buffer risked a deadlock and
+            // counted the pre-fill silence into the clock.
             if (client_started) {
                 dev_->client->Stop();
                 dev_->client->Reset();
-                client_started = false;
-                device_paused = false;
-                dev_->started = false;
+                if (paused_) {
+                    device_paused = true;  // resume will Start() it
+                } else {
+                    dev_->client->Start();
+                    device_paused = false;
+                }
             }
             std::lock_guard<std::mutex> lk(clock_m_);
             fifo_end_pts_ = NAN;
@@ -565,15 +571,11 @@ bool AudioOut::run_device() {
             memset(buf + (size_t)take * out_ch * 4, 0, ((size_t)want - take) * out_ch * 4);
         dev_->render->ReleaseBuffer(want, 0);
 
-        // Start once real audio is queued at first startup; after a flush
-        // Stop/Reset, restart as soon as ANY buffer is released (even silence)
-        // — waiting for take>0 there can deadlock: a stopped client never
-        // drains, so padding stays pinned, want goes to 0, and take>0 becomes
-        // unreachable, killing audio for the rest of the file.
-        if (!client_started && (take > 0 || ever_started)) {
+        // Start once real audio is queued (the flush path above restarts the
+        // client itself, so this only fires at first startup).
+        if (!client_started && take > 0) {
             dev_->client->Start();
             client_started = true;
-            ever_started = true;
             dev_->started = true;
         }
 

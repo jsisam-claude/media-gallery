@@ -200,7 +200,10 @@ void player_toggle_pause(Player* p) {
     if (now) p->extclk_set(p->master_clock());  // freeze the no-audio clock here
     p->paused = now;
     p->ao.pause(now);
-    if (!now) p->extclk_set(p->vclock.load());  // re-anchor no-audio clock
+    if (!now) {
+        p->step_req = false;  // drop any step a paused seek armed but didn't consume
+        p->extclk_set(p->vclock.load());  // re-anchor no-audio clock
+    }
 }
 
 bool player_is_paused(Player* p) { return p->paused; }
@@ -483,6 +486,14 @@ void player_set_event_callback(Player* p, PlayerEventFn fn, void* user) {
 
 bool player_media_ended(Player* p) { return p->ended; }
 
+bool player_is_buffering(Player* p) {
+    if (!p->running || p->paused || p->ended || p->eof) return false;
+    // Starved: nothing decoded or queued to render on the streams we have.
+    bool v_empty = p->vst < 0 || (p->vfq.count() == 0 && p->vq.count() == 0);
+    bool a_empty = p->ast < 0 || (p->afq.count() == 0 && p->aq.count() == 0);
+    return v_empty && a_empty;
+}
+
 void player_set_mute(Player* p, bool m) { p->ao.set_mute(m); }
 bool player_is_muted(Player* p) { return p->ao.muted(); }
 
@@ -508,6 +519,11 @@ static AVDictionary* safe_open_opts(const std::string& u8) {
     if (u8.find("://") != std::string::npos) {
         av_dict_set(&opts, "protocol_whitelist", "http,https,tcp,tls,udp,crypto,data", 0);
         av_dict_set(&opts, "tls_verify", "1", 0);
+        // Ride out brief network hiccups instead of ending the stream: without
+        // this, a transient EIO from av_read_frame is treated as EOF.
+        av_dict_set(&opts, "reconnect", "1", 0);
+        av_dict_set(&opts, "reconnect_streamed", "1", 0);
+        av_dict_set(&opts, "reconnect_delay_max", "5", 0);
     } else {
         av_dict_set(&opts, "protocol_whitelist", "file,crypto,data", 0);
     }

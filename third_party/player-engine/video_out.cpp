@@ -17,6 +17,33 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 }
 
+// swscale coefficient set for a frame's colorspace (resolution heuristic when
+// unsignalled) — used so the software YUV conversion matches the matrix the
+// video processor / shader expects.
+static int sws_cs_for(const AVFrame* f) {
+    switch (f->colorspace) {
+        case AVCOL_SPC_BT709: return SWS_CS_ITU709;
+        case AVCOL_SPC_BT470BG:
+        case AVCOL_SPC_SMPTE170M: return SWS_CS_ITU601;
+        case AVCOL_SPC_BT2020_NCL:
+        case AVCOL_SPC_BT2020_CL: return SWS_CS_BT2020;
+        default: return f->height >= 720 ? SWS_CS_ITU709 : SWS_CS_ITU601;
+    }
+}
+
+// Pin the scaler's input/output range and coefficients. dst_full=false keeps
+// the destination range equal to the source (YUV->YUV upload: the VP handles
+// range via its colorspace flag, so swscale must NOT compress full->limited);
+// dst_full=true is for the YUV->RGB shader fallback, where swscale itself does
+// the full conversion and RGB wants full range.
+static void sws_pin_colorspace(SwsContext* sws, const AVFrame* f, bool dst_full) {
+    if (!sws) return;
+    int src_full = (f->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
+    const int* c = sws_getCoefficients(sws_cs_for(f));
+    sws_setColorspaceDetails(sws, c, src_full, c, dst_full ? 1 : src_full,
+                             0, 1 << 16, 1 << 16);
+}
+
 template <class T> static void safe_release(T*& p) {
     if (p) { p->Release(); p = nullptr; }
 }
@@ -668,6 +695,11 @@ static bool render_vp(D3DState* d, AVFrame* f, ID3D11Texture2D* back,
                                   w, h, p010 ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12,
                                   SWS_BILINEAR, nullptr, nullptr, nullptr);
     if (!d->sws) return false;
+    // Preserve range: the VP is told the input range via set_colorspace, so
+    // swscale must not silently compress a full-range (yuvj) source to limited
+    // — that double-limiting is what washed out software-decoded full-range
+    // clips (MJPEG, full-range H.264 with HW decode off).
+    sws_pin_colorspace(d->sws, f, /*dst_full=*/false);
     uint8_t* dst[2] = {d->nv12, d->nv12 + (size_t)pitch * h};
     int dst_stride[2] = {pitch, pitch};
     sws_scale(d->sws, f->data, f->linesize, 0, h, dst, dst_stride);
@@ -706,6 +738,10 @@ static bool render_shader(D3DState* d, AVFrame* f, ID3D11Texture2D* back,
                                   w, h, AV_PIX_FMT_BGRA, SWS_BILINEAR,
                                   nullptr, nullptr, nullptr);
     if (!d->sws) return false;
+    // The shader fallback does no colorspace itself, so swscale must apply the
+    // right matrix (709 for HD, not its 601 default) and expand to full-range
+    // RGB — otherwise HD content shows a green/magenta shift.
+    sws_pin_colorspace(d->sws, f, /*dst_full=*/true);
     uint8_t* dst[1] = {d->nv12};
     int dst_stride[1] = {pitch};
     sws_scale(d->sws, f->data, f->linesize, 0, h, dst, dst_stride);

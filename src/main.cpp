@@ -720,7 +720,8 @@ HICON TypeIconFor(const std::wstring& path) {
     HICON icon = nullptr;
     if (SHGetFileInfoW(path.c_str(), FILE_ATTRIBUTE_NORMAL, &sfi, sizeof(sfi),
                        SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES))
-        icon = sfi.hIcon; // owned; bounded by distinct-extension count, freed at exit
+        icon = sfi.hIcon; // bounded by distinct-extension count (not session
+                          // length); the OS reclaims these handles at exit
     cache[ext] = icon;
     return icon;
 }
@@ -1677,6 +1678,10 @@ void DeleteAt(int index) {
     }
     g.gridSel = (std::max)(0, (std::min)(index, (int)g.files.size() - 1));
     if (g.gridMode) GridEnsureVisible();
+    // The index<cur and index>cur branches above don't call LoadCurrent, so
+    // re-arm the slideshow timer we killed (idempotent if LoadCurrent already
+    // did on the index==cur path).
+    rearmSlideshow();
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 

@@ -220,13 +220,27 @@ static void load_state() {
     fclose(f);
 }
 
+// Keep the live memory maps from growing without bound over a long session
+// (thousands of distinct files). The on-disk write already keeps only 500;
+// mirror that ceiling in memory by dropping an arbitrary older entry.
+template <class Map>
+static void cap_map(Map& m, const std::wstring& keep) {
+    while (m.size() > 500) {
+        auto it = m.begin();
+        if (it->first == keep && ++it == m.end()) break;
+        m.erase(it);
+    }
+}
+
 static void remember_position() {
     if (g_cur_path.empty() || !g_player) return;
     double pos = player_position(g_player), dur = player_duration(g_player);
-    if (pos > 15 && dur > 0 && pos < dur * 0.95 && !player_media_ended(g_player))
+    if (pos > 15 && dur > 0 && pos < dur * 0.95 && !player_media_ended(g_player)) {
         g_resume[g_cur_path] = pos;
-    else
+        cap_map(g_resume, g_cur_path);
+    } else {
         g_resume.erase(g_cur_path);
+    }
 }
 
 // Called after any explicit track change so the choice sticks per file.
@@ -234,6 +248,7 @@ static void remember_tracks() {
     if (g_cur_path.empty() || !g_player || !player_has_media(g_player)) return;
     g_track_mem[g_cur_path] = {player_audio_track_current(g_player),
                                player_sub_track_current(g_player)};
+    cap_map(g_track_mem, g_cur_path);
 }
 
 static void build_siblings(const wchar_t* path) {
@@ -1587,7 +1602,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 !player_is_paused(g_player) && !player_media_ended(g_player)) {
                 double pos = player_position(g_player);
                 ULONGLONG now = GetTickCount64();
-                if (pos != g_stall_pos) {
+                // A no-audio stream's position free-runs on wall time even
+                // while starved, so pair the position check with the engine's
+                // queue-empty signal to catch those stalls too.
+                if (pos != g_stall_pos && !player_is_buffering(g_player)) {
                     g_stall_pos = pos;
                     g_stall_t = now;
                 } else if (now - g_stall_t > 700) {

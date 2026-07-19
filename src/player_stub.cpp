@@ -13,6 +13,7 @@ bool player_open(Player*, const wchar_t*) { return false; }
 void player_close(Player*) {}
 bool player_has_media(Player*) { return false; }
 bool player_media_ended(Player*) { return false; }
+bool player_is_buffering(Player*) { return false; }
 
 void player_toggle_pause(Player*) {}
 bool player_is_paused(Player*) { return false; }

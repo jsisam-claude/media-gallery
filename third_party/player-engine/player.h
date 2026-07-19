@@ -24,6 +24,9 @@ bool player_open(Player* p, const wchar_t* path);  // async; events follow
 void player_close(Player* p);
 bool player_has_media(Player* p);
 bool player_media_ended(Player* p);
+// True when playback is starved (queues empty, not paused/ended) — a network
+// stall the position clock can't reveal because it free-runs on wall time.
+bool player_is_buffering(Player* p);
 
 void player_toggle_pause(Player* p);
 bool player_is_paused(Player* p);
