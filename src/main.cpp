@@ -686,7 +686,10 @@ void GridZoom(bool in) {
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 
-void NavigateTo(int index, bool resetPage); // fwd decl (defined below)
+// relative=true means index is a move off the current item (Next/Prev), so it
+// gets translated if a modal reorders the list; absolute callers (grid,
+// filmstrip, shuffle) pass false and their index is used as-is.
+void NavigateTo(int index, bool resetPage = true, bool relative = false);
 
 void OpenFromGrid(int index) {
     if (index < 0 || index >= (int)g.files.size()) return;
@@ -1284,7 +1287,7 @@ void SlideshowAdvance() {
         if (idx >= g.cur) ++idx;
         NavigateTo(idx, true); // fwd decl has no default arg yet
     } else {
-        NavigateTo(g.cur + 1, true);
+        NavigateTo(g.cur + 1, true, /*relative=*/true);
     }
 }
 
@@ -1421,17 +1424,17 @@ void MaybeCommitRotation() {
     g.rot = 0;
 }
 
-void NavigateTo(int index, bool resetPage = true) {
+void NavigateTo(int index, bool resetPage, bool relative) {
     if (g.files.empty()) return;
     const int before = g.cur;
     MaybeCommitRotation();  // may pump a modal whose loop replaces g.files/g.cur
     if (g.files.empty()) return;
     const int n = (int)g.files.size();
-    // If the modal's message loop swapped in the folder-scan results and
-    // re-pointed g.cur at the shown file, the caller's absolute index (built
-    // from the old g.cur, e.g. g.cur+1) is stale — translate it by the same
-    // shift so a relative move still lands on the intended neighbor.
-    if (before >= 0 && g.cur != before) index += g.cur - before;
+    // Only a RELATIVE move (Next/Prev, built from the old g.cur) is stale if the
+    // modal's message loop swapped in the folder-scan results and re-pointed
+    // g.cur — translate it by the same shift so it still lands on the intended
+    // neighbor. An absolute index (grid/filmstrip pick) is used unchanged.
+    if (relative && before >= 0 && g.cur != before) index += g.cur - before;
     index = ((index % n) + n) % n;
     g.cur = index;
     if (resetPage) g.page = 0;
@@ -1963,11 +1966,11 @@ void OnCommand(WORD id) {
             break;
         case IDM_NEXT:
             if (g.gridMode) GridMoveSel(1);
-            else if (!g.files.empty()) NavigateTo(g.cur + 1);
+            else if (!g.files.empty()) NavigateTo(g.cur + 1, true, /*relative=*/true);
             break;
         case IDM_PREV:
             if (g.gridMode) GridMoveSel(-1);
-            else if (!g.files.empty()) NavigateTo(g.cur - 1);
+            else if (!g.files.empty()) NavigateTo(g.cur - 1, true, /*relative=*/true);
             break;
         case IDM_PAGE_NEXT:
             if (g.gridMode) GridMoveSel(g.gridCols);

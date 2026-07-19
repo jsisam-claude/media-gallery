@@ -70,17 +70,19 @@ public:
                  std::vector<float>& out) {
         if (speed > 0.99 && speed < 1.01) {  // unity: bypass
             if (primed_) {
-                // Flush the input we'd buffered but not yet emitted before
-                // dropping out of stretch mode, or returning to 1.0x skips
-                // ~40-60ms of audio (an audible click). cont_ is the exact
-                // first not-yet-output input sample: the last hop's output
-                // reached input index best+half_, so raw passthrough resumes
-                // there for a continuous handover.
+                // Flush the audio buffered but not yet emitted, or returning to
+                // 1.0x skips ~40-60ms (an audible click). tail_ IS the pending
+                // not-yet-output window (input [best+half_, best+win_)); for
+                // speed>1 the per-hop erase has already dropped that span from
+                // in_, so tail_ is the only surviving copy. Emit tail_, then the
+                // input past the window (cont_+half_ in current in_ coords) —
+                // correct and gap-free for both slow and fast.
+                out.insert(out.end(), tail_.begin(), tail_.end());
                 int have = (int)(in_.size() / ch_);
-                int pos = cont_;
-                if (pos < 0) pos = 0;
-                if (pos < have)
-                    out.insert(out.end(), in_.begin() + (size_t)pos * ch_, in_.end());
+                int wend = cont_ + half_;
+                if (wend < 0) wend = 0;
+                if (wend < have)
+                    out.insert(out.end(), in_.begin() + (size_t)wend * ch_, in_.end());
                 reset();
             }
             out.insert(out.end(), in, in + (size_t)nsamples * ch_);
