@@ -381,13 +381,23 @@ static void draw_overlays(D3DState* d, ID3D11Texture2D* backbuffer,
 
     if (text.empty() && ov.osd.empty()) return;
 
-    // Size and anchor text subtitles to the displayed video rect, not the
-    // window, so a small/letterboxed video keeps subtitles proportional to
-    // the picture — consistent with the bitmap-subtitle path above. (The OSD
+    // Size and anchor text subtitles to the VISIBLE part of the video rect,
+    // not the window, so a small/letterboxed video keeps subtitles
+    // proportional to the picture — consistent with the bitmap-subtitle path
+    // above. Clamped to the backbuffer because crop-fill mode intentionally
+    // makes dst_rc larger than the window; an unclamped box would lay the
+    // text out below the surface where D2D clips it away entirely. (The OSD
     // banner below stays window-anchored on purpose: it's a UI notification.)
-    int vid_w = dst_rc.right - dst_rc.left;
-    int vid_h = dst_rc.bottom - dst_rc.top;
-    if (vid_w <= 0 || vid_h <= 0) { vid_w = d->out_w; vid_h = d->out_h; }
+    RECT vis = {(std::max)(dst_rc.left, 0L), (std::max)(dst_rc.top, 0L),
+                (std::min)(dst_rc.right, (LONG)d->out_w),
+                (std::min)(dst_rc.bottom, (LONG)d->out_h)};
+    int vid_w = vis.right - vis.left;
+    int vid_h = vis.bottom - vis.top;
+    if (vid_w <= 0 || vid_h <= 0) {
+        vis = {0, 0, (LONG)d->out_w, (LONG)d->out_h};
+        vid_w = d->out_w;
+        vid_h = d->out_h;
+    }
     int px = (int)(vid_h / 18 * d->sub_scale);
     if (px < 12) px = 12;
     if (!d->text_fmt || d->text_fmt_px != px) {
@@ -402,8 +412,8 @@ static void draw_overlays(D3DState* d, ID3D11Texture2D* backbuffer,
     }
 
     float margin = vid_w * 0.05f;
-    D2D1_RECT_F box = D2D1::RectF(dst_rc.left + margin, (float)dst_rc.top,
-                                  dst_rc.right - margin, dst_rc.bottom - px * 0.75f);
+    D2D1_RECT_F box = D2D1::RectF(vis.left + margin, (float)vis.top,
+                                  vis.right - margin, vis.bottom - px * 0.75f);
 
     ID2D1SolidColorBrush *black = nullptr, *white = nullptr;
     d->d2drt->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.9f), &black);
@@ -644,7 +654,9 @@ static bool render_vp(D3DState* d, AVFrame* f, ID3D11Texture2D* back,
     bool p010 = pd && pd->comp[0].depth > 8 && !d->no_p010;
     int bpp = p010 ? 2 : 1;
     int pitch = (w * bpp + 127) & ~127;
-    size_t need = (size_t)pitch * h * 3 / 2;
+    // Chroma has ceil(h/2) rows: for odd heights, pitch*h*3/2 under-allocates
+    // by one row and sws_scale writes past the buffer.
+    size_t need = (size_t)pitch * h + (size_t)pitch * ((h + 1) / 2);
     if (need > d->nv12_size) {
         av_free(d->nv12);
         d->nv12 = (uint8_t*)av_malloc(need);

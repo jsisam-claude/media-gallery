@@ -50,6 +50,7 @@ public:
     void push(AVPacket* src);            // takes ownership of the ref
     bool pop(Pkt& out, int timeout_ms);  // false on timeout/abort
     void flush();                        // clears, bumps serial, queues marker
+    void clear();                        // clears + bumps serial, NO marker
     void push_drain();                   // queues an EOF drain marker
     void set_abort(bool a);
     int serial() const { return serial_.load(); }
@@ -279,6 +280,9 @@ struct Player {
     bool cover_only = false;          // "video" is just attached cover art
     bool has_external_subs = false;
     int sub_choice = 0;               // index into effective sub track list; 0 = default
+    int sub_count_snapshot = 0;       // track count sub_choice indexes; survives the
+                                      // reopen window where sub_names is cleared, so
+                                      // "current track" doesn't misreport as off
     AVCodecContext* vctx = nullptr;
     AVCodecContext* actx = nullptr;
     AVCodecContext* sctx = nullptr;

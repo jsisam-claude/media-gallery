@@ -1350,6 +1350,10 @@ void LoadCurrent() {
                 g.player, OnPlayerEvent,
                 reinterpret_cast<void*>(static_cast<UINT_PTR>(++g.playerGen)));
             player_open(g.player, path.c_str());
+            // Landed here while the grid is up (folder drop, delete): the
+            // child window stays hidden, so don't let audio play invisibly.
+            if (g.gridMode && !player_is_paused(g.player))
+                player_toggle_pause(g.player);
             g.worker.RequestProbe(path);
             SetTimer(g.hwnd, kTimerVideo, 100, nullptr); // smooth seek-fill motion
         } else if (auto img = CacheGet(CacheKey(path, g.page))) {
@@ -1375,11 +1379,20 @@ void LoadCurrent() {
 // Offer to persist an unsaved rotation before leaving the image.
 void MaybeCommitRotation() {
     if (g.rot == 0 || !g.disp || g.cur < 0) return;
+    // A save for this rotation is already queued (Ctrl+S then navigate):
+    // asking again would rotate the file a second time.
+    if (g.savePending) {
+        g.rot = 0;
+        return;
+    }
     // By value: MessageBoxW below pumps a modal loop, during which a folder
     // scan's WM_APP_LIST can replace g.files and free the referenced string.
     const std::wstring path = g.files[g.cur];
     ImageDecoder* dec = FindDecoder(path);
     if (dec && dec->CanSaveRotation(path, *g.disp)) {
+        // Silence the slideshow while the prompt is up — its timer would fire
+        // into the modal loop and re-enter navigation under our feet.
+        KillTimer(g.hwnd, kTimerSlideshow);
         std::wstring msg = L"Save the rotation to \"";
         msg += PathFindFileNameW(path.c_str());
         msg += L"\"?";
@@ -1388,6 +1401,8 @@ void MaybeCommitRotation() {
             g.savePending = true;
             g.worker.RequestSave(path, g.rot);
         }
+        if (g.slideshow && !g.gridMode && !g.videoMode)
+            SetTimer(g.hwnd, kTimerSlideshow, g.slideshowMs, nullptr);
     }
     g.rot = 0;
 }
@@ -1641,6 +1656,7 @@ void DeleteAt(int index) {
 
 void EditInPaint(int index) {
     if (index < 0 || index >= (int)g.files.size()) return;
+    if (IsVideoFile(g.files[index])) return; // Paint can't open video files
     if (index == g.cur) {
         MaybeCommitRotation();
         UpdateTitle();
@@ -1780,8 +1796,14 @@ void OnPlayerMessage(WPARAM evt, LPARAM gen) {
             g.videoEnded = true;
             // A finished video stays put on its last frame; we never auto-advance
             // to the next item. Only an explicit slideshow cycles through media.
-            if (g.slideshow && g.files.size() > 1) {
-                SlideshowAdvance(); // shuffle-aware
+            if (g.slideshow) {
+                if (g.files.size() > 1) {
+                    SlideshowAdvance(); // shuffle-aware
+                    return;
+                }
+                // Single-item slideshow: loop the video, or the mode would
+                // silently die after one playthrough (flag on, no timer).
+                VideoPlayPause(); // videoEnded restart path: seek 0 + play
                 return;
             }
             break;
@@ -1796,6 +1818,10 @@ void OnPlayerMessage(WPARAM evt, LPARAM gen) {
             g.decodeFailed = true;
             if (g.player) player_close(g.player);
             KillTimer(g.hwnd, kTimerVideo);
+            // A slideshow was waiting on ENDED, which will never come — dwell
+            // on the error like an image, then move on, instead of wedging.
+            if (g.slideshow && g.files.size() > 1)
+                SetTimer(g.hwnd, kTimerSlideshow, g.slideshowMs, nullptr);
             PositionVideoWindow();
             break;
         }
@@ -1940,7 +1966,10 @@ void OnInitMenuPopup(HMENU menu) {
         EnableMenuItem(menu, id, MF_BYCOMMAND | (on ? MF_ENABLED : MF_GRAYED));
     };
     const bool haveAny = !g.files.empty();
-    enable(IDM_EDIT_PAINT, g.gridMode ? haveAny : haveImage);
+    const bool gridSelImage = g.gridMode && g.gridSel >= 0 &&
+                              g.gridSel < (int)g.files.size() &&
+                              !IsVideoFile(g.files[g.gridSel]);
+    enable(IDM_EDIT_PAINT, g.gridMode ? gridSelImage : haveImage);
     enable(IDM_DELETE, g.gridMode ? haveAny : haveImage);
     enable(IDM_ROTATE_CW, haveDisp && !g.gridMode);
     enable(IDM_ROTATE_CCW, haveDisp && !g.gridMode);
@@ -2122,10 +2151,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 KillTimer(hwnd, kTimerHq);
                 g.interactive = false;
                 InvalidateRect(hwnd, nullptr, FALSE);
-            } else if (wParam == kTimerVideo && g.videoMode) {
+            } else if (wParam == kTimerVideo && g.videoMode && !g.gridMode) {
                 // Repaint only the transport bar; a full-window invalidate on
                 // every tick would redraw thumbnails, details and letterbox
-                // for a change confined to the seek fill and time text.
+                // for a change confined to the seek fill and time text. Grid
+                // mode draws no bar at all — repainting there would thrash
+                // the thumbnail grid at 10Hz for nothing.
                 Layout L = ComputeLayout(ClientRect());
                 RECT bar = {L.imgArea.left, L.imgArea.bottom - Scaled(kVideoBarH),
                             L.imgArea.right, L.imgArea.bottom};

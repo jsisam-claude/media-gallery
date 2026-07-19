@@ -141,8 +141,15 @@ static void save_state(HWND hwnd) {
         fwprintf(f, L"K|%d,%d|%s\n", kv.second.first, kv.second.second,
                  kv.first.c_str());
     }
+    // While fullscreen, the live placement is the borderless monitor rect;
+    // persist the pre-fullscreen geometry instead or the user's window size
+    // is permanently replaced by a monitor-sized "restored" window.
     WINDOWPLACEMENT wp = {sizeof(WINDOWPLACEMENT)};
-    if (hwnd && GetWindowPlacement(hwnd, &wp))
+    if (g_fullscreen)
+        wp = g_saved_placement;
+    else if (!hwnd || !GetWindowPlacement(hwnd, &wp))
+        wp.rcNormalPosition = {};
+    if (wp.rcNormalPosition.right > wp.rcNormalPosition.left)
         fwprintf(f, L"W|%ld,%ld,%ld,%ld,%u\n",
                  wp.rcNormalPosition.left, wp.rcNormalPosition.top,
                  wp.rcNormalPosition.right, wp.rcNormalPosition.bottom,
@@ -869,7 +876,11 @@ static void playlist_load_m3u(HWND hwnd, const wchar_t* path) {
         if (wn > 1) MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, &wl[0], wn);
         if (wl.empty()) continue;
         wchar_t full[MAX_PATH * 2];
-        if (PathIsRelativeW(wl.c_str()))
+        // URLs are absolute even though PathIsRelativeW says otherwise (no
+        // drive letter/leading slash); prefixing the playlist dir would turn
+        // every stream entry into an unopenable local path.
+        bool url = wl.find(L"://") != std::wstring::npos;
+        if (!url && PathIsRelativeW(wl.c_str()))
             swprintf(full, MAX_PATH * 2, L"%s\\%s", dir.c_str(), wl.c_str());
         else
             wcsncpy(full, wl.c_str(), MAX_PATH * 2 - 1), full[MAX_PATH * 2 - 1] = 0;
@@ -1545,17 +1556,22 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             UINT n = DragQueryFileW((HDROP)wp, 0xFFFFFFFF, nullptr, 0);
             wchar_t path[MAX_PATH];
             if (n > 1) {  // multi-drop builds a queue
-                g_playlist.clear();
-                g_pl_cur = -1;
+                // Filter first, replace after: clearing up front would destroy
+                // the existing queue even when nothing dropped is playable.
+                std::vector<std::wstring> dropped;
                 for (UINT i = 0; i < n; i++)
                     if (DragQueryFileW((HDROP)wp, i, path, MAX_PATH) &&
                         is_media_ext(path))
-                        g_playlist.push_back(path);
-                if (!g_playlist.empty()) {
+                        dropped.push_back(path);
+                if (!dropped.empty()) {
+                    g_playlist = std::move(dropped);
+                    g_pl_cur = -1;
                     playlist_play(hwnd, 0);
                     wchar_t b[64];
                     swprintf(b, 64, L"Queue: %d files", (int)g_playlist.size());
                     osd(b);
+                } else {
+                    osd(L"No supported media in the drop");
                 }
             } else if (DragQueryFileW((HDROP)wp, 0, path, MAX_PATH)) {
                 open_any(hwnd, path);
@@ -1668,6 +1684,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             update_ui(hwnd);
             return 0;
+        case WM_QUERYENDSESSION:
+            // Shutdown/logoff never delivers WM_CLOSE; persist now or the
+            // session's volume, positions and track choices are all lost.
+            remember_position();
+            save_state(hwnd);
+            return TRUE;
         case WM_CLOSE:
             remember_position();
             save_state(hwnd);
@@ -1724,10 +1746,18 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int show) {
             wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
             if (argv) {
                 for (int i = 1; i < argc; i++) {
+                    // Resolve relative paths against THIS process's CWD before
+                    // handing them over — the first instance would resolve
+                    // them against its own CWD and open the wrong file.
+                    wchar_t full[2048];
+                    const wchar_t* send = argv[i];
+                    if (!wcsstr(argv[i], L"://") &&
+                        GetFullPathNameW(argv[i], 2048, full, nullptr))
+                        send = full;
                     COPYDATASTRUCT cds = {};
                     cds.dwData = i == 1 ? 1 : 2;  // open first, enqueue rest
-                    cds.cbData = (DWORD)((wcslen(argv[i]) + 1) * sizeof(wchar_t));
-                    cds.lpData = argv[i];
+                    cds.cbData = (DWORD)((wcslen(send) + 1) * sizeof(wchar_t));
+                    cds.lpData = const_cast<wchar_t*>(send);
                     SendMessageW(other, WM_COPYDATA, 0, (LPARAM)&cds);
                 }
                 LocalFree(argv);
@@ -1822,7 +1852,15 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int show) {
 
     if (g_have_placement) {
         g_loaded_placement.length = sizeof(WINDOWPLACEMENT);
-        SetWindowPlacement(g_main, &g_loaded_placement);
+        // Sanity-check the stored rect: a corrupt state line or a monitor
+        // that's since been unplugged would otherwise restore the window
+        // degenerate or entirely off-screen (SetWindowPlacement won't clamp).
+        const RECT& r = g_loaded_placement.rcNormalPosition;
+        bool sane = r.right - r.left >= 200 && r.bottom - r.top >= 150 &&
+                    r.right - r.left <= 16384 && r.bottom - r.top <= 16384 &&
+                    MonitorFromRect(&r, MONITOR_DEFAULTTONULL) != nullptr;
+        if (sane) SetWindowPlacement(g_main, &g_loaded_placement);
+        else g_have_placement = false;  // fall back to the default geometry
     }
     apply_dark_titlebar(g_main);
     layout(g_main);

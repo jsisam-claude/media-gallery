@@ -69,6 +69,20 @@ void PacketQueue::flush() {
     cv_.notify_all();
 }
 
+// Teardown variant of flush(): the decoder threads are already joined, so a
+// flush marker would never be consumed — for a stream the next media doesn't
+// have, that stuck entry keeps count() at 1 and the EOF/ENDED gate (which
+// waits for empty queues) never passes.
+void PacketQueue::clear() {
+    std::lock_guard<std::mutex> lk(m_);
+    for (auto& e : q_)
+        if (e.p) av_packet_free(&e.p);
+    q_.clear();
+    bytes_ = 0;
+    serial_++;
+    cv_.notify_all();
+}
+
 void PacketQueue::push_drain() {
     std::lock_guard<std::mutex> lk(m_);
     // Same serial as the real packets before it, so the decoder drains the

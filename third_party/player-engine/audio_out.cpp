@@ -429,6 +429,15 @@ bool AudioOut::run_device() {
             av_audio_fifo_reset(fifo_);
             stretch.reset();
             queued_pts = NAN;
+            // Also discard what already reached the device: without a Reset,
+            // up to ~200ms of pre-seek audio keeps playing after every seek.
+            if (client_started) {
+                dev_->client->Stop();
+                dev_->client->Reset();
+                client_started = false;
+                device_paused = false;
+                dev_->started = false;
+            }
             std::lock_guard<std::mutex> lk(clock_m_);
             fifo_end_pts_ = NAN;
         }
@@ -562,10 +571,14 @@ bool AudioOut::run_device() {
         }
 
         // clock = pts at fifo end, minus what is still buffered (fifo +
-        // device), converted from real seconds to media seconds by speed
+        // device), converted from real seconds to media seconds by speed.
+        // Device-held media is padding (earlier writes) + take (the frames
+        // just written); the (want - take) tail is silence, not media — the
+        // old "padding + (want-take)" made the clock jump ~200ms ahead at
+        // start, dropping the opening frames and stuttering to re-sync.
         if (!std::isnan(queued_pts)) {
             double buffered = (double)av_audio_fifo_size(fifo_) / out_rate +
-                              (double)(padding + (want - take)) / out_rate;
+                              (double)(padding + take) / out_rate;
             std::lock_guard<std::mutex> lk(clock_m_);
             fifo_end_pts_ = queued_pts - buffered * spd_used;
         }

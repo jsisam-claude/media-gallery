@@ -7,6 +7,11 @@ void SubtitleList::add(double start, double end, std::wstring text) {
     if (text.empty()) return;
     std::lock_guard<std::mutex> lk(m_);
     entries_.push_back({start, end, std::move(text)});
+    // Bound memory like the bitmap list below: a pathological internal text
+    // stream (or an endless live stream) would otherwise grow this forever.
+    // Entries arrive roughly time-ordered, so the evicted front is long past.
+    if (entries_.size() > 16384)
+        entries_.erase(entries_.begin(), entries_.begin() + 4096);
 }
 
 std::wstring SubtitleList::active_at(double pts) {
@@ -150,7 +155,11 @@ void subs_decode_packet(AVCodecContext* ctx, AVPacket* pkt, AVRational tb,
 std::wstring subs_find_sidecar(const wchar_t* media_path) {
     std::wstring base(media_path);
     size_t dot = base.find_last_of(L'.');
-    if (dot != std::wstring::npos) base.resize(dot);
+    size_t sep = base.find_last_of(L"\\/");
+    // Only strip a dot that belongs to the FILENAME; an extensionless file in
+    // a dotted directory ("C:\my.files\clip") must not truncate to "C:\my".
+    if (dot != std::wstring::npos && (sep == std::wstring::npos || dot > sep))
+        base.resize(dot);
     for (const wchar_t* ext : {L".srt", L".ass", L".ssa"}) {
         std::wstring cand = base + ext;
         DWORD attr = GetFileAttributesW(cand.c_str());

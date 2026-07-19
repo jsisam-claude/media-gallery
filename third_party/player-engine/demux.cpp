@@ -142,6 +142,7 @@ static bool open_input(Player* p) {
     p->has_external_subs =
         subs_load_sidecar(p->path.c_str(), &p->subs, p->start_time) > 0;
     int n_subs = (p->has_external_subs ? 1 : 0) + (int)p->sub_streams.size();
+    p->sub_count_snapshot = n_subs;
     if (n_subs == 0) {
         p->sst = -1;
     } else {
@@ -331,6 +332,10 @@ void demux_thread(Player* p) {
     // visualization (no cover art) via the same VideoOut.
     if (p->vst >= 0 || p->ast >= 0) p->th_vrender = std::thread(video_render_thread, p);
     p->running = true;
+    // Paused (re)open — e.g. a track switch while paused: the paused render
+    // loop only presents on request, and teardown freed last_frame, so
+    // without a step the window stays black until the user resumes.
+    if (p->paused && p->vst >= 0) p->step_req = true;
     p->fire(PLAYER_EVT_OPENED);
 
     AVPacket* pkt = av_packet_alloc();

@@ -39,6 +39,10 @@ double Player::master_clock() {
     }
     std::lock_guard<std::mutex> lk(extclk_m);
     if (std::isnan(extclk_pts)) return NAN;
+    // Frozen while paused: toggle_pause re-anchors at the pause moment, and
+    // advancing with wall time here would make the position display creep
+    // forward (and the resume re-anchor jump) on paused no-audio media.
+    if (paused) return extclk_pts;
     return extclk_pts + (av_gettime_relative() - extclk_time) / 1e6 * speed;
 }
 
@@ -89,14 +93,16 @@ static void stop_pipeline(Player* p) {
     p->aq.set_abort(false);
     p->vfq.set_abort(false);
     p->afq.set_abort(false);
-    // Flush the PACKET queues too, not just the frame queues. Abort makes the
+    // Clear the PACKET queues too, not just the frame queues. Abort makes the
     // decoders return from pop() without draining, so undecoded packets from
     // this media stay queued; the next file reuses these queues, and because
     // their serial is unchanged its decoder would accept and decode the stale
     // packets — playing the previous clip's audio/video over the new one.
-    // flush() frees them and bumps the serial so any straggler is dropped.
-    p->vq.flush();
-    p->aq.flush();
+    // clear(), not flush(): the decoder threads are joined, so a flush marker
+    // would sit unconsumed and hold count() at 1 forever — for a stream the
+    // next media lacks, that blocks the ENDED gate (silent video/music files).
+    p->vq.clear();
+    p->aq.clear();
     p->vfq.flush();
     p->afq.flush();
     p->subs.clear();
@@ -185,6 +191,7 @@ bool player_has_media(Player* p) { return p->running || p->th_demux.joinable(); 
 
 void player_toggle_pause(Player* p) {
     bool now = !p->paused;
+    if (now) p->extclk_set(p->master_clock());  // freeze the no-audio clock here
     p->paused = now;
     p->ao.pause(now);
     if (!now) p->extclk_set(p->vclock.load());  // re-anchor no-audio clock
@@ -304,7 +311,11 @@ int player_sub_track_count(Player* p) {
 }
 
 int player_sub_track_current(Player* p) {
-    int n = player_sub_track_count(p);
+    // Compare against the snapshot, not the live name list: during an async
+    // track-switch reopen the names are momentarily cleared, and deriving the
+    // count from them here would misreport the selection as "off" — which the
+    // shell's per-file track memory then records and re-applies for good.
+    int n = p->sub_count_snapshot;
     return p->sub_choice >= n ? -1 : p->sub_choice;
 }
 
@@ -518,6 +529,22 @@ bool player_probe(const wchar_t* path, PlayerMediaInfo* info) {
         if (par->codec_type == AVMEDIA_TYPE_VIDEO && !info->width) {
             info->width = par->width;
             info->height = par->height;
+            // Report display orientation, like playback and thumbnails do:
+            // a 90/270 display-matrix rotation swaps the visible dimensions.
+            const AVPacketSideData* sd = av_packet_side_data_get(
+                par->coded_side_data, par->nb_coded_side_data,
+                AV_PKT_DATA_DISPLAYMATRIX);
+            if (sd && sd->size >= 9 * sizeof(int32_t)) {
+                double a = av_display_rotation_get((const int32_t*)sd->data);
+                if (!std::isnan(a)) {
+                    int rot = ((((int)lround(-a) % 360) + 360) % 360 + 45) / 90 * 90 % 360;
+                    if (rot == 90 || rot == 270) {
+                        int t = info->width;
+                        info->width = info->height;
+                        info->height = t;
+                    }
+                }
+            }
             std::wstring n = utf8_to_wide(avcodec_get_name(par->codec_id));
             wcsncpy(info->video_codec, n.c_str(), 31);
         } else if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
@@ -604,7 +631,14 @@ bool player_extract_thumb_at(const wchar_t* path, double at_seconds,
         if (!frame || !pkt) break;
         bool got = false;
         for (int packets = 0; !got && packets < 512; ) {
-            if (av_read_frame(fc, pkt) < 0) break;
+            if (av_read_frame(fc, pkt) < 0) {
+                // EOF with nothing emitted yet: the codec may still hold
+                // reordered frames — drain them or very short clips (fewer
+                // frames than the reorder delay) never yield a thumbnail.
+                if (avcodec_send_packet(ctx, nullptr) >= 0)
+                    while (avcodec_receive_frame(ctx, frame) >= 0) got = true;
+                break;
+            }
             if (pkt->stream_index == vst) {
                 packets++;
                 if (avcodec_send_packet(ctx, pkt) >= 0)
@@ -724,6 +758,10 @@ bool player_snapshot(Player* p, const wchar_t* png_path) {
     if (sw->sample_aspect_ratio.num > 0 && sw->sample_aspect_ratio.den > 0)
         dw = (int)av_rescale(w, sw->sample_aspect_ratio.num,
                              sw->sample_aspect_ratio.den);
+    // A corrupt/hostile SAR could make dw explode into a multi-GB allocation
+    // (uncaught bad_alloc). No legitimate anamorphic factor reaches 4x.
+    if (dw > w * 4) dw = w * 4;
+    if (dw > 16384) dw = 16384;
     SwsContext* sc = nullptr;
     if (w > 0 && h > 0 && dw > 0) {
         std::vector<uint32_t> bgra((size_t)dw * h);
