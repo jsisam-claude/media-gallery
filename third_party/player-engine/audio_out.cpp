@@ -68,7 +68,18 @@ public:
     void process(const float* in, int nsamples, double speed,
                  std::vector<float>& out) {
         if (speed > 0.99 && speed < 1.01) {  // unity: bypass
-            if (primed_) reset();
+            if (primed_) {
+                // Flush the input we'd buffered but not yet emitted before
+                // dropping out of stretch mode, or returning to 1.0x skips
+                // ~40-60ms of audio (an audible click). src_ is the next
+                // window's start = the first not-yet-output input sample.
+                int have = (int)(in_.size() / ch_);
+                int pos = (int)(src_ + 0.5);
+                if (pos < 0) pos = 0;
+                if (pos < have)
+                    out.insert(out.end(), in_.begin() + (size_t)pos * ch_, in_.end());
+                reset();
+            }
             out.insert(out.end(), in, in + (size_t)nsamples * ch_);
             return;
         }

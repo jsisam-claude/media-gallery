@@ -1,5 +1,5 @@
 Origin: vlc-light-win64 (minimal-player engine)
-Commit: b7cd99c9707d4c72d9c291c503c2a1f14f4160ad
+Commit: 0acb12c70509fc2c0e5f7987760fc9dc59e1e3ff
 Files: 11 engine sources (+ LICENSE), 3 shell files (+ VERSION) in ../player-shell, plus 1128 files mirrored verbatim into third_party/ffmpeg-src and third_party/ffmpeg-config (see their own PROVENANCE.txt) and cmake/ffmpeg.cmake + cmake/ffmpeg_sources.txt, plus 809 files mirrored verbatim into third_party/libass-src and third_party/libass-config (see their own PROVENANCE.txt) and cmake/libass.cmake.
 Vendored by tools/vendor_player.cmake; unmodified upstream text.
 License: LGPL-2.1-or-later (LICENSE in this directory).
