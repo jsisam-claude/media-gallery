@@ -414,6 +414,7 @@ bool AudioOut::run_device() {
 
     double queued_pts = NAN;  // pts at the *end* of everything pushed into fifo
     bool client_started = false;
+    bool ever_started = false;  // client has run at least once (past first start)
     bool device_paused = false;
     bool lost = false;
     HRESULT hr;
@@ -564,9 +565,15 @@ bool AudioOut::run_device() {
             memset(buf + (size_t)take * out_ch * 4, 0, ((size_t)want - take) * out_ch * 4);
         dev_->render->ReleaseBuffer(want, 0);
 
-        if (!client_started && take > 0) {
+        // Start once real audio is queued at first startup; after a flush
+        // Stop/Reset, restart as soon as ANY buffer is released (even silence)
+        // — waiting for take>0 there can deadlock: a stopped client never
+        // drains, so padding stays pinned, want goes to 0, and take>0 becomes
+        // unreachable, killing audio for the rest of the file.
+        if (!client_started && (take > 0 || ever_started)) {
             dev_->client->Start();
             client_started = true;
+            ever_started = true;
             dev_->started = true;
         }
 

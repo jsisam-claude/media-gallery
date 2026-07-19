@@ -10,7 +10,7 @@ set(FF_SRC ${CMAKE_SOURCE_DIR}/third_party/ffmpeg-src)
 set(FF_CFG ${CMAKE_SOURCE_DIR}/third_party/ffmpeg-config)
 
 if(NOT EXISTS ${FF_SRC}/libavcodec/avcodec.h)
-  message(FATAL_ERROR "third_party/ffmpeg-src missing - the vendored FFmpeg subset should be committed in this repo (see tools/vendor_ffmpeg.py)")
+  message(FATAL_ERROR "third_party/ffmpeg-src missing - the vendored FFmpeg subset should be committed in this repo (see tools/vendor_ffmpeg.cmake)")
 endif()
 
 file(STRINGS ${CMAKE_SOURCE_DIR}/cmake/ffmpeg_sources.txt FF_REL_SOURCES

@@ -88,7 +88,10 @@ if(MEDIAGALLERY_VIDEO)
         CXX_STANDARD_REQUIRED ON
     )
     target_compile_definitions(player_engine PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
-    target_compile_options(player_engine PRIVATE /W4 /utf-8)
+    # Match the engine repo's hardening (/sdl /guard:cf): these sources parse
+    # untrusted media, so the CFG the FFmpeg/libass objects carry should also
+    # apply here — and stay in step with how the player repo ships them.
+    target_compile_options(player_engine PRIVATE /W4 /utf-8 /sdl /guard:cf)
     target_include_directories(player_engine PUBLIC third_party/player-engine)
     target_link_libraries(player_engine
         PRIVATE ffmpeg libass
@@ -119,7 +122,10 @@ if(MEDIAGALLERY_VIDEO)
         CXX_STANDARD_REQUIRED ON
     )
     target_compile_definitions(minimal-player PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
-    target_compile_options(minimal-player PRIVATE /W4 /utf-8)
+    target_compile_options(minimal-player PRIVATE /W4 /utf-8 /sdl /guard:cf)
+    # Without /guard:cf at link, the CFG instrumentation in the engine/FFmpeg
+    # objects is inert — this exe must be hardened like the engine repo's.
+    target_link_options(minimal-player PRIVATE /DYNAMICBASE /NXCOMPAT /guard:cf)
     target_link_libraries(minimal-player PRIVATE
         player_engine
         shell32 gdi32 comctl32 comdlg32 shlwapi dwmapi

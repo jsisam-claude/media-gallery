@@ -654,8 +654,21 @@ void ToggleGrid() {
 
 void GridMoveSel(int delta) {
     if (g.files.empty()) return;
+    const int n = (int)g.files.size();
+    const int cols = (std::max)(1, g.gridCols);
     int sel = g.gridSel + delta;
-    sel = (std::max)(0, (std::min)(sel, (int)g.files.size() - 1));
+    // Vertical moves (±cols) keep the column: going up off the top row is a
+    // no-op (not a jump to item 0), and going down is a no-op unless it lands
+    // in a partial last row, where it clamps to the final item like Explorer.
+    if (delta == cols || delta == -cols) {
+        if (sel < 0) return;                  // above the first row
+        if (sel >= n) {
+            if (g.gridSel / cols == (n - 1) / cols) return; // already last row
+            sel = n - 1;                      // into a partial last row
+        }
+    } else {
+        sel = (std::max)(0, (std::min)(sel, n - 1));
+    }
     if (sel == g.gridSel) return;
     g.gridSel = sel;
     GridEnsureVisible();
@@ -1588,6 +1601,8 @@ void DeleteAt(int index) {
     if (index < 0 || index >= (int)g.files.size()) return;
     const std::wstring path = g.files[index];
 
+    const bool wasSlideshow = g.slideshow && !g.gridMode && !g.videoMode;
+
     // A playing engine holds the file open, which makes the recycle-bin
     // move fail silently — release it first.
     const bool closedVideo = index == g.cur && g.videoMode;
@@ -1597,6 +1612,9 @@ void DeleteAt(int index) {
     if (FAILED(CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL,
                                 IID_IFileOperation, reinterpret_cast<void**>(&op))))
         return;
+    // The recycle-confirm dialog pumps a modal loop; silence the slideshow
+    // timer so it can't re-enter navigation and shift items mid-delete.
+    if (wasSlideshow) KillTimer(g.hwnd, kTimerSlideshow);
     bool deleted = false;
     op->SetOwnerWindow(g.hwnd);
     op->SetOperationFlags(FOF_ALLOWUNDO); // Recycle Bin, standard confirmations
@@ -1612,8 +1630,15 @@ void DeleteAt(int index) {
         item->Release();
     }
     op->Release();
+    // LoadCurrent re-arms the slideshow timer from g.slideshow; on paths that
+    // don't call it, restore the timer we killed above.
+    auto rearmSlideshow = [&] {
+        if (wasSlideshow && g.slideshow && !g.gridMode && !g.videoMode)
+            SetTimer(g.hwnd, kTimerSlideshow, g.slideshowMs, nullptr);
+    };
     if (!deleted) {
         if (closedVideo) LoadCurrent(); // reopen the video we closed above
+        else rearmSlideshow();
         return;
     }
 
@@ -1626,6 +1651,7 @@ void DeleteAt(int index) {
     if (index < 0) {
         // Already absent from the current listing (the scan dropped it too).
         if (closedVideo) LoadCurrent();
+        else rearmSlideshow();
         return;
     }
 
@@ -1818,10 +1844,16 @@ void OnPlayerMessage(WPARAM evt, LPARAM gen) {
             g.decodeFailed = true;
             if (g.player) player_close(g.player);
             KillTimer(g.hwnd, kTimerVideo);
-            // A slideshow was waiting on ENDED, which will never come — dwell
-            // on the error like an image, then move on, instead of wedging.
-            if (g.slideshow && g.files.size() > 1)
-                SetTimer(g.hwnd, kTimerSlideshow, g.slideshowMs, nullptr);
+            // A slideshow was waiting on ENDED, which will never come. With
+            // other items, dwell on the error then advance; a single failing
+            // item has nowhere to go, so stop the slideshow instead of leaving
+            // it "on" with no timer and no way to progress.
+            if (g.slideshow) {
+                if (g.files.size() > 1)
+                    SetTimer(g.hwnd, kTimerSlideshow, g.slideshowMs, nullptr);
+                else
+                    StopSlideshow();
+            }
             PositionVideoWindow();
             break;
         }
@@ -1969,7 +2001,9 @@ void OnInitMenuPopup(HMENU menu) {
     const bool gridSelImage = g.gridMode && g.gridSel >= 0 &&
                               g.gridSel < (int)g.files.size() &&
                               !IsVideoFile(g.files[g.gridSel]);
-    enable(IDM_EDIT_PAINT, g.gridMode ? gridSelImage : haveImage);
+    // Not in video mode: Paint can't open a .mp4/.mkv, so the item would
+    // silently no-op if the menu let it through.
+    enable(IDM_EDIT_PAINT, g.gridMode ? gridSelImage : (haveDisp && !g.videoMode));
     enable(IDM_DELETE, g.gridMode ? haveAny : haveImage);
     enable(IDM_ROTATE_CW, haveDisp && !g.gridMode);
     enable(IDM_ROTATE_CCW, haveDisp && !g.gridMode);
@@ -2203,8 +2237,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             OnProbed(reinterpret_cast<ProbeDone*>(lParam));
             return 0;
         case WM_CLOSE:
-            // Last chance to persist an unsaved rotation (synchronous: we're exiting).
-            if (g.rot != 0 && g.disp && g.cur >= 0) {
+            // Silence the slideshow first: its timer must not fire into the
+            // save prompt's modal loop and reset g.rot before we read it.
+            KillTimer(hwnd, kTimerSlideshow);
+            g.slideshow = false;
+            // Last chance to persist an unsaved rotation (synchronous: we're
+            // exiting). Skip if a save for this rotation is already queued —
+            // prompting again would apply the same quarter-turn a second time
+            // and race the worker's ReplaceFileW on the same file.
+            if (g.rot != 0 && g.disp && g.cur >= 0 && !g.savePending) {
                 // By value: MessageBoxW pumps a modal loop that can deliver a
                 // WM_APP_LIST and free the string this would otherwise alias.
                 const std::wstring path = g.files[g.cur];

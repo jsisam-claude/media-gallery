@@ -311,6 +311,11 @@ static void do_seek(Player* p, double target) {
     p->ended_fired = false;
     p->precise_v = ts / (double)AV_TIME_BASE;  // consumers drop up to here
     p->precise_a = ts / (double)AV_TIME_BASE;
+    // While paused the render loop only presents on request, so a seek would
+    // leave the pre-seek frame frozen on screen (and the position readout
+    // stuck) until the user resumes. Step once to show the sought frame; the
+    // step path's discard loop uses precise_v (set just above) to land on it.
+    if (p->paused && p->vst >= 0) p->step_req = true;
 }
 
 void demux_thread(Player* p) {

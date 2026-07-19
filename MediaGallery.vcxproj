@@ -49,6 +49,9 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <ControlFlowGuard>Guard</ControlFlowGuard>
+      <!-- UTF-8 sources with no BOM carry wide UI glyphs; without /utf-8 MSVC
+           reads them in the system codepage and labels render as mojibake. -->
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <PreprocessorDefinitions>UNICODE;_UNICODE;_WIN32_WINNT=0x0A00;WINVER=0x0A00;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <!-- player.h only; player_stub.cpp keeps this an image-only build (video = CMake route). -->
       <AdditionalIncludeDirectories>third_party\player-engine;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>

@@ -51,6 +51,15 @@ public:
         }
         ReadMetadata(bmp, path, *out);
 
+        // Enforce the decompression-bomb guard BEFORE ApplyExifOrientation:
+        // RotateFlip forces a full decode and a second rotated allocation, so
+        // a huge crafted image with an orientation tag would blow past the
+        // pixel cap before the check if it ran afterward.
+        {
+            UINT w0 = bmp.GetWidth(), h0 = bmp.GetHeight();
+            if (w0 == 0 || h0 == 0 || UINT64(w0) * h0 > kMaxPixels) return nullptr;
+        }
+
         // Bake EXIF orientation into pixels so the app never worries about it.
         ApplyExifOrientation(bmp);
 

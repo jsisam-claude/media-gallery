@@ -105,6 +105,12 @@ static void stop_pipeline(Player* p) {
     p->aq.clear();
     p->vfq.flush();
     p->afq.flush();
+    // Resync the decoder serial mirrors to the freshly-bumped queue serial.
+    // The mirrors only advance when a flush *marker* is consumed; clear()
+    // leaves none, so without this the audio path (which gates frames on the
+    // mirror) would reject every frame of the next file until the first seek.
+    p->vq_serial.store(p->vq.serial());
+    p->aq_serial.store(p->aq.serial());
     p->subs.clear();
     p->audio_streams.clear();
     p->sub_streams.clear();
@@ -208,10 +214,12 @@ void player_frame_step(Player* p) {
 void player_frame_back(Player* p) {
     if (!p->running) return;
     if (!p->paused) player_toggle_pause(p);
-    // Exact-seek slightly behind the shown frame, then step to display it.
+    // Exact-seek slightly behind the shown frame; do_seek arms the step once
+    // it has set precise_v, so the discard loop lands on the previous frame.
+    // (Setting step_req here would race the async seek: the render loop could
+    // consume it before do_seek runs, presenting the NEXT frame instead.)
     double pos = player_position(p);
     player_seek_to(p, pos > 0.07 ? pos - 0.07 : 0);
-    p->step_req = true;
 }
 
 void player_set_hw_decode(Player* p, bool on) { p->want_hw = on; }

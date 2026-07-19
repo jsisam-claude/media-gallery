@@ -6,7 +6,10 @@ setlocal
 rc /nologo /I src /fo MediaGallery.res src\MediaGallery.rc || exit /b 1
 
 rem player_stub.cpp = image-only build; video needs the CMake route (BUILDING.md).
-cl /nologo /std:c++17 /O2 /W4 /EHsc /MT /GS /guard:cf ^
+rem /utf-8: the sources are UTF-8 with no BOM and carry wide UI glyphs
+rem (arrows, ellipsis, em dashes) — without it MSVC reads them in the system
+rem codepage and the buttons/labels render as mojibake.
+cl /nologo /std:c++17 /O2 /W4 /EHsc /MT /GS /guard:cf /utf-8 ^
    /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00 ^
    /I third_party\player-engine ^
    src\main.cpp src\decoder_gdiplus.cpp src\decoder_wic.cpp src\filmstrip.cpp ^

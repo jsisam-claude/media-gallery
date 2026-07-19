@@ -5,6 +5,7 @@
 #include "decoder.h"
 
 #include <wincodec.h>
+#include <propidl.h>   // PROPVARIANT + PropVariantInit/Clear
 
 #include <algorithm>
 
@@ -39,19 +40,39 @@ public:
             dec->Release();
             return nullptr;
         }
-        out->pageCount = frames;
+        // Extra frames in a WIC container are almost always animation, not
+        // navigable pages (classic multi-page TIFF routes through GDI+, which
+        // is registered first). Don't expose a page bar over animation frames;
+        // multiFrame still guards rotation-save and can note it in details.
+        out->pageCount = 1;
         out->multiFrame = frames > 1;
         AddFormatMeta(dec, *out);
 
         IWICBitmapFrameDecode* frame = nullptr;
-        HRESULT hr = dec->GetFrame((std::min)(page, frames - 1), &frame);
+        HRESULT hr = dec->GetFrame(0, &frame);
         dec->Release();
         if (FAILED(hr)) return nullptr;
 
-        IWICBitmapSource* src = nullptr;
-        hr = WICConvertBitmapSource(GUID_WICPixelFormat32bppBGRA, frame, &src);
+        WICBitmapTransformOptions orient = OrientationOf(frame);
+
+        IWICBitmapSource* conv = nullptr;
+        hr = WICConvertBitmapSource(GUID_WICPixelFormat32bppBGRA, frame, &conv);
         frame->Release();
         if (FAILED(hr)) return nullptr;
+
+        // Bake EXIF orientation into pixels (GDI+ does this too), so WIC-only
+        // formats — JPEG XR, camera RAW via Store codecs — aren't shown
+        // sideways with no in-app way to correct them.
+        IWICBitmapSource* src = conv;
+        IWICBitmapFlipRotator* rot = nullptr;
+        if (orient != WICBitmapTransformRotate0 &&
+            SUCCEEDED(factory_->CreateBitmapFlipRotator(&rot)) &&
+            SUCCEEDED(rot->Initialize(conv, orient))) {
+            src = rot;          // rot holds a ref on conv
+            conv->Release();
+        } else if (rot) {
+            rot->Release();
+        }
 
         UINT w = 0, h = 0;
         src->GetSize(&w, &h);
@@ -108,6 +129,40 @@ private:
             if (!e.empty() &&
                 std::find(extensions_.begin(), extensions_.end(), e) == extensions_.end())
                 extensions_.push_back(e);
+        }
+    }
+
+    // EXIF orientation (tag 274) mapped to the flip/rotate that undoes it.
+    // Read via the frame's metadata query reader; absent/unknown => identity.
+    WICBitmapTransformOptions OrientationOf(IWICBitmapFrameDecode* frame) const {
+        IWICMetadataQueryReader* q = nullptr;
+        if (FAILED(frame->GetMetadataQueryReader(&q)) || !q)
+            return WICBitmapTransformRotate0;
+        unsigned short o = 0;
+        for (const wchar_t* path :
+             {L"/app1/ifd/{ushort=274}", L"/ifd/{ushort=274}",
+              L"/app1/ifd/exif/{ushort=274}"}) {
+            PROPVARIANT v;
+            PropVariantInit(&v);
+            if (SUCCEEDED(q->GetMetadataByName(path, &v)) && v.vt == VT_UI2) {
+                o = v.uiVal;
+                PropVariantClear(&v);
+                break;
+            }
+            PropVariantClear(&v);
+        }
+        q->Release();
+        switch (o) {
+            case 2:  return WICBitmapTransformFlipHorizontal;
+            case 3:  return WICBitmapTransformRotate180;
+            case 4:  return WICBitmapTransformFlipVertical;
+            case 5:  return (WICBitmapTransformOptions)(WICBitmapTransformRotate90 |
+                                                        WICBitmapTransformFlipHorizontal);
+            case 6:  return WICBitmapTransformRotate90;
+            case 7:  return (WICBitmapTransformOptions)(WICBitmapTransformRotate270 |
+                                                        WICBitmapTransformFlipHorizontal);
+            case 8:  return WICBitmapTransformRotate270;
+            default: return WICBitmapTransformRotate0;
         }
     }
 
