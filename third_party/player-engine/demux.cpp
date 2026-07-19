@@ -96,6 +96,12 @@ static bool open_input(Player* p) {
     if (u8.find("://") != std::string::npos) {
         av_dict_set(&opts, "protocol_whitelist", "http,https,tcp,tls,udp,crypto,data", 0);
         av_dict_set(&opts, "tls_verify", "1", 0);
+        // Ride out brief network hiccups on the PLAYBACK stream instead of
+        // ending it: a transient EIO from av_read_frame otherwise reads as EOF.
+        // (Only here — the one-shot probe/thumbnail opens want to fail fast.)
+        av_dict_set(&opts, "reconnect", "1", 0);
+        av_dict_set(&opts, "reconnect_streamed", "1", 0);
+        av_dict_set(&opts, "reconnect_delay_max", "5", 0);
     } else {
         av_dict_set(&opts, "protocol_whitelist", "file,crypto,data", 0);
     }

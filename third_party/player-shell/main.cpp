@@ -834,6 +834,10 @@ static void open_path(HWND hwnd, const wchar_t* path) {
     preview_clear_cache();
     g_loop_a = g_loop_b = -1;
     g_stall_pos = -1;
+    // Reset the stall clock too: otherwise a stale (previous-file) g_stall_t
+    // makes the "Buffering…" 700ms guard fire immediately during pre-roll,
+    // because the new queue-empty check keeps the reset branch from running.
+    g_stall_t = GetTickCount64();
     if (!g_cur_is_url)
         SHAddToRecentDocs(SHARD_PATHW, path);  // taskbar "Recent" jump list
     player_open(g_player, path);

@@ -519,11 +519,9 @@ static AVDictionary* safe_open_opts(const std::string& u8) {
     if (u8.find("://") != std::string::npos) {
         av_dict_set(&opts, "protocol_whitelist", "http,https,tcp,tls,udp,crypto,data", 0);
         av_dict_set(&opts, "tls_verify", "1", 0);
-        // Ride out brief network hiccups instead of ending the stream: without
-        // this, a transient EIO from av_read_frame is treated as EOF.
-        av_dict_set(&opts, "reconnect", "1", 0);
-        av_dict_set(&opts, "reconnect_streamed", "1", 0);
-        av_dict_set(&opts, "reconnect_delay_max", "5", 0);
+        // NB: no reconnect here — probe/thumbnail are one-shot fast-fail opens
+        // guarded by the 5s deadline; reconnect belongs on the playback stream
+        // (demux.cpp open_input), not here where it would stall probes.
     } else {
         av_dict_set(&opts, "protocol_whitelist", "file,crypto,data", 0);
     }
@@ -571,10 +569,12 @@ bool player_probe(const wchar_t* path, PlayerMediaInfo* info) {
             }
             std::wstring n = utf8_to_wide(avcodec_get_name(par->codec_id));
             wcsncpy(info->video_codec, n.c_str(), 31);
+            info->video_codec[31] = 0;  // wcsncpy won't NUL-terminate on overflow
         } else if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
             if (!info->audio_tracks) {
                 std::wstring n = utf8_to_wide(avcodec_get_name(par->codec_id));
                 wcsncpy(info->audio_codec, n.c_str(), 31);
+                info->audio_codec[31] = 0;
             }
             info->audio_tracks++;
         } else if (par->codec_type == AVMEDIA_TYPE_SUBTITLE) {

@@ -155,10 +155,15 @@ private:
         if (img.GetPropertyItem(id, size, pi) != Ok) return;
         if (pi->type != PropertyTagTypeASCII || pi->length == 0 || !pi->value) return;
         const char* s = static_cast<const char*>(pi->value);
-        int wlen = MultiByteToWideChar(CP_ACP, 0, s, -1, nullptr, 0);
-        if (wlen <= 1) return;
-        std::wstring w(wlen - 1, L'\0');
-        MultiByteToWideChar(CP_ACP, 0, s, -1, &w[0], wlen);
+        // Bound the conversion by the item's declared value length, NOT a -1
+        // NUL scan: a crafted EXIF ASCII value that omits the trailing NUL
+        // would make MultiByteToWideChar read past the property buffer (heap
+        // over-read shown in the details pane).
+        int n = (int)pi->length;
+        int wlen = MultiByteToWideChar(CP_ACP, 0, s, n, nullptr, 0);
+        if (wlen <= 0) return;
+        std::wstring w(wlen, L'\0');
+        MultiByteToWideChar(CP_ACP, 0, s, n, &w[0], wlen);
         while (!w.empty() && (w.back() == L' ' || w.back() == L'\0')) w.pop_back();
         if (!w.empty()) out.meta.emplace_back(label, w);
     }
