@@ -1423,9 +1423,16 @@ void MaybeCommitRotation() {
 
 void NavigateTo(int index, bool resetPage = true) {
     if (g.files.empty()) return;
+    const int before = g.cur;
+    MaybeCommitRotation();  // may pump a modal whose loop replaces g.files/g.cur
+    if (g.files.empty()) return;
     const int n = (int)g.files.size();
+    // If the modal's message loop swapped in the folder-scan results and
+    // re-pointed g.cur at the shown file, the caller's absolute index (built
+    // from the old g.cur, e.g. g.cur+1) is stale — translate it by the same
+    // shift so a relative move still lands on the intended neighbor.
+    if (before >= 0 && g.cur != before) index += g.cur - before;
     index = ((index % n) + n) % n;
-    MaybeCommitRotation();
     g.cur = index;
     if (resetPage) g.page = 0;
     g.rot = 0;

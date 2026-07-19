@@ -63,6 +63,7 @@ public:
         tail_.assign((size_t)half_ * ch_, 0.0f);
         primed_ = false;
         src_ = 0;
+        cont_ = 0;
     }
     // Consumes nsamples interleaved floats, appends stretched audio to out.
     void process(const float* in, int nsamples, double speed,
@@ -71,10 +72,12 @@ public:
             if (primed_) {
                 // Flush the input we'd buffered but not yet emitted before
                 // dropping out of stretch mode, or returning to 1.0x skips
-                // ~40-60ms of audio (an audible click). src_ is the next
-                // window's start = the first not-yet-output input sample.
+                // ~40-60ms of audio (an audible click). cont_ is the exact
+                // first not-yet-output input sample: the last hop's output
+                // reached input index best+half_, so raw passthrough resumes
+                // there for a continuous handover.
                 int have = (int)(in_.size() / ch_);
-                int pos = (int)(src_ + 0.5);
+                int pos = cont_;
                 if (pos < 0) pos = 0;
                 if (pos < have)
                     out.insert(out.end(), in_.begin() + (size_t)pos * ch_, in_.end());
@@ -106,6 +109,10 @@ public:
             }
             memcpy(tail_.data(), seg + (size_t)half_ * ch_,
                    (size_t)half_ * ch_ * sizeof(float));
+            // The emitted output reached input index best+half_ (tail_ is the
+            // pending, not-yet-output audio just past it) — that's where raw
+            // passthrough must resume if speed goes to 1.0x.
+            cont_ = best + half_;
             src_ += half_ * speed;
 
             int drop = (int)src_ - seek_ - 1;  // keep the search slack behind
@@ -113,6 +120,7 @@ public:
                 if (drop > have) drop = have;
                 in_.erase(in_.begin(), in_.begin() + (size_t)drop * ch_);
                 src_ -= drop;
+                cont_ -= drop;  // keep cont_ in current in_ coordinates
             }
         }
     }
@@ -142,6 +150,7 @@ private:
     int ch_ = 2, win_ = 0, half_ = 0, seek_ = 0;
     bool primed_ = false;
     double src_ = 0;
+    int cont_ = 0;  // in_ index where emitted output reached (for unity handover)
     std::vector<float> in_, tail_;
 };
 
