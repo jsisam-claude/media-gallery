@@ -381,7 +381,14 @@ static void draw_overlays(D3DState* d, ID3D11Texture2D* backbuffer,
 
     if (text.empty() && ov.osd.empty()) return;
 
-    int px = (int)(d->out_h / 18 * d->sub_scale);
+    // Size and anchor text subtitles to the displayed video rect, not the
+    // window, so a small/letterboxed video keeps subtitles proportional to
+    // the picture — consistent with the bitmap-subtitle path above. (The OSD
+    // banner below stays window-anchored on purpose: it's a UI notification.)
+    int vid_w = dst_rc.right - dst_rc.left;
+    int vid_h = dst_rc.bottom - dst_rc.top;
+    if (vid_w <= 0 || vid_h <= 0) { vid_w = d->out_w; vid_h = d->out_h; }
+    int px = (int)(vid_h / 18 * d->sub_scale);
     if (px < 12) px = 12;
     if (!d->text_fmt || d->text_fmt_px != px) {
         safe_release(d->text_fmt);
@@ -394,8 +401,9 @@ static void draw_overlays(D3DState* d, ID3D11Texture2D* backbuffer,
         d->text_fmt_px = px;
     }
 
-    float margin = d->out_w * 0.05f;
-    D2D1_RECT_F box = D2D1::RectF(margin, 0.0f, d->out_w - margin, d->out_h - px * 0.75f);
+    float margin = vid_w * 0.05f;
+    D2D1_RECT_F box = D2D1::RectF(dst_rc.left + margin, (float)dst_rc.top,
+                                  dst_rc.right - margin, dst_rc.bottom - px * 0.75f);
 
     ID2D1SolidColorBrush *black = nullptr, *white = nullptr;
     d->d2drt->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.9f), &black);

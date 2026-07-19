@@ -17,8 +17,6 @@ constexpr int kPad = 6;
 constexpr int kGap = 6;
 constexpr size_t kCacheCap = 512;
 
-int CellSize(int stripH) { return stripH - 2 * kPad; }
-
 // Scale a decoded image down into a device bitmap (fallback when the shell
 // can't produce a thumbnail, e.g. exotic formats without a thumbnail handler).
 HBITMAP ThumbFromDecoded(const DecodedImage& img, int maxSide) {
@@ -249,6 +247,11 @@ void Filmstrip::Request(const std::wstring& path, int px) {
 
 int Filmstrip::Height(int dpi) const { return MulDiv(kBaseHeight, dpi, 96); }
 
+// Pads and gaps scale with DPI like the strip height does; fixed-pixel spacing
+// makes 96px-proportioned cells look crammed at 150/200% scaling.
+int Filmstrip::Pad() const { return MulDiv(kPad, dpi_, 96); }
+int Filmstrip::Gap() const { return MulDiv(kGap, dpi_, 96); }
+
 void Filmstrip::Scroll(int wheelDelta) {
     scrollX_ -= wheelDelta; // clamped in Draw where the width is known
     if (scrollX_ < 0) scrollX_ = 0;
@@ -256,11 +259,12 @@ void Filmstrip::Scroll(int wheelDelta) {
 
 int Filmstrip::HitTest(POINT pt, const RECT& rc) const {
     if (!items_ || pt.y < rc.top || pt.y >= rc.bottom) return -1;
-    int cell = CellSize(rc.bottom - rc.top);
-    int x = pt.x - rc.left - kGap + scrollX_;
+    const int gap = Gap();
+    int cell = (rc.bottom - rc.top) - 2 * Pad();
+    int x = pt.x - rc.left - gap + scrollX_;
     if (x < 0) return -1;
-    int idx = x / (cell + kGap);
-    if (x % (cell + kGap) >= cell) return -1; // in the gap
+    int idx = x / (cell + gap);
+    if (x % (cell + gap) >= cell) return -1; // in the gap
     return (idx >= 0 && idx < (int)items_->size()) ? idx : -1;
 }
 
@@ -271,29 +275,30 @@ void Filmstrip::Draw(HDC dc, const RECT& rc) {
     if (!items_ || items_->empty()) return;
 
     const int stripH = rc.bottom - rc.top;
-    const int cell = CellSize(stripH);
-    const int step = cell + kGap;
+    const int pad = Pad(), gap = Gap();
+    const int cell = stripH - 2 * pad;
+    const int step = cell + gap;
     const int viewW = rc.right - rc.left;
     const int n = (int)items_->size();
-    const int contentW = kGap + n * step;
+    const int contentW = gap + n * step;
 
     if (pendingEnsureVisible_ && current_ >= 0) {
-        int cx = kGap + current_ * step;
-        if (cx - scrollX_ < 0) scrollX_ = cx - kGap;
-        else if (cx + cell - scrollX_ > viewW) scrollX_ = cx + cell - viewW + kGap;
+        int cx = gap + current_ * step;
+        if (cx - scrollX_ < 0) scrollX_ = cx - gap;
+        else if (cx + cell - scrollX_ > viewW) scrollX_ = cx + cell - viewW + gap;
         pendingEnsureVisible_ = false;
     }
     int maxScroll = (std::max)(0, contentW - viewW);
     if (scrollX_ > maxScroll) scrollX_ = maxScroll;
     if (scrollX_ < 0) scrollX_ = 0;
 
-    int first = (std::max)(0, (scrollX_ - kGap) / step);
+    int first = (std::max)(0, (scrollX_ - gap) / step);
     int last = (std::min)(n - 1, (scrollX_ + viewW) / step);
 
     HDC mem = CreateCompatibleDC(dc);
     for (int i = first; i <= last; ++i) {
         const std::wstring& path = (*items_)[i];
-        RECT cellRc{rc.left + kGap + i * step - scrollX_, rc.top + kPad, 0, 0};
+        RECT cellRc{rc.left + gap + i * step - scrollX_, rc.top + pad, 0, 0};
         cellRc.right = cellRc.left + cell;
         cellRc.bottom = cellRc.top + cell;
 

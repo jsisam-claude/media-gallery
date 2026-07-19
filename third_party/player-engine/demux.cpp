@@ -336,6 +336,7 @@ void demux_thread(Player* p) {
     AVPacket* pkt = av_packet_alloc();
     const size_t MAX_QUEUE_BYTES = 16 * 1024 * 1024;
     bool eof_drained = false;  // drain markers pushed once per EOF
+    int read_errors = 0;       // consecutive hard av_read_frame failures
 
     while (!p->abort) {
         {
@@ -344,6 +345,7 @@ void demux_thread(Player* p) {
                 do_seek(p, p->seek_to);
                 p->seek_req = false;
                 eof_drained = false;  // more data may follow the seek target
+                read_errors = 0;      // the seek may unwedge a failing read
             }
         }
 
@@ -354,6 +356,16 @@ void demux_thread(Player* p) {
         }
 
         int ret = av_read_frame(p->fmt, pkt);
+        // A demuxer wedged on a persistent hard error would otherwise spin in
+        // the ret<0 branch forever — warm CPU and a clip that never ends.
+        // After ~3s of nothing but errors, declare the stream over. EAGAIN is
+        // excluded: it's a legitimate "try again later" for live inputs.
+        if (ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EIO) &&
+            ret != AVERROR(EAGAIN) && ++read_errors >= 300) {
+            log_line("demux: %d consecutive read errors, treating as EOF",
+                     read_errors);
+            ret = AVERROR_EOF;
+        }
         if (ret == AVERROR_EOF || ret == AVERROR(EIO)) {
             p->eof = true;
             if (!eof_drained) {
@@ -376,6 +388,7 @@ void demux_thread(Player* p) {
             Sleep(10);
             continue;
         }
+        read_errors = 0;
 
         if (pkt->stream_index == p->vst) {
             p->vq.push(pkt);

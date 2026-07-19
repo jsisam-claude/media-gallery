@@ -20,6 +20,7 @@ public:
 
     void SetItems(const std::vector<std::wstring>* items); // owned by the app
     void SetCurrent(int index);                            // scrolls it into view
+    void SetDpi(int dpi) { dpi_ = dpi; }                   // scales pads/gaps
     void InvalidateThumb(const std::wstring& path);        // file changed on disk
 
     struct ThumbResult {
@@ -47,6 +48,8 @@ public:
     static constexpr int kSizes[3] = {256, 768, 1536};
 
 private:
+    int Pad() const;  // strip padding at the current DPI
+    int Gap() const;  // inter-cell gap at the current DPI
     void EvictIfNeeded();
     static DWORD WINAPI ThreadProc(void* self);
     void WorkerLoop();
@@ -56,6 +59,7 @@ private:
 
     const std::vector<std::wstring>* items_ = nullptr;
     int current_ = -1;
+    int dpi_ = 96;
     int scrollX_ = 0;
     bool pendingEnsureVisible_ = false;
 

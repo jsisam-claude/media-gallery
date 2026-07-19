@@ -185,10 +185,12 @@ struct ListReq {
 };
 
 std::wstring ParentDir(const std::wstring& path) {
-    wchar_t buf[MAX_PATH];
-    lstrcpynW(buf, path.c_str(), MAX_PATH);
-    PathRemoveFileSpecW(buf);
-    return buf;
+    // No fixed MAX_PATH buffer: a longer path would come back truncated, the
+    // folder scan would fail, and the file would open with no prev/next.
+    size_t cut = path.find_last_of(L'\\');
+    if (cut == std::wstring::npos) return L"";
+    if (cut == 2 && path[1] == L':') cut = 3; // keep the root slash of "C:\x"
+    return path.substr(0, cut);
 }
 
 bool IsPlayableVideo(const std::wstring& path); // fwd decl (needs app state, defined below)
@@ -269,6 +271,10 @@ std::vector<std::wstring> EnumerateDirNaturalOrder(const std::wstring& dir) {
     if (h == INVALID_HANDLE_VALUE) return out;
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        // Match the Explorer-order path (and Explorer defaults): don't surface
+        // hidden/system files, or the two enumerators disagree on the item set.
+        if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))
+            continue;
         std::wstring full = base + fd.cFileName;
         if (IsSupportedImage(full) || IsPlayableVideo(full)) out.push_back(std::move(full));
     } while (FindNextFileW(h, &fd));
@@ -377,9 +383,24 @@ struct App {
     Player* player = nullptr;
     unsigned playerGen = 0;        // open generation; drops stale engine events
     bool videoMode = false;        // current item plays in the engine
+    bool videoOpened = false;      // OPENED arrived; child window may show
     bool videoEnded = false;       // playback reached end of media
     bool videoProbed = false;      // videoInfo holds data for the current item
     PlayerMediaInfo videoInfo{};   // filled by the worker thread via WM_APP_PROBED
+    std::wstring videoError;       // engine diagnostic captured on PLAYER_EVT_ERROR
+
+    std::wstring failReason;       // specific decode-failure text ("" = generic)
+    bool listWasEmpty = false;     // a folder scan finished with zero usable files
+
+    // Optimistic seek: paint the bar at the requested position briefly so a
+    // click doesn't rubber-band while the async seek completes.
+    double seekFlashPos = -1;      // <0 = none
+    DWORD seekFlashTick = 0;
+
+    // Details rows are rebuilt only when something they show changes; building
+    // them stats the file on disk, far too heavy for every WM_PAINT.
+    std::vector<std::pair<std::wstring, std::wstring>> detailRows;
+    bool detailsDirty = true;
 
     std::vector<CacheEntry> cache; // tiny LRU of decoded images
     DecodeWorker worker;
@@ -527,8 +548,10 @@ Layout ComputeLayout(const RECT& client) {
     if (viewW <= areaW) {
         L.srcX = 0;
         L.srcW = g.dispW;
-        L.dest.left = L.imgArea.left + (LONG)((areaW - viewW) / 2);
-        L.dest.right = L.dest.left + (LONG)viewW;
+        // Round the offset once so the left/right margins match; truncating
+        // offset and width independently can leave them a pixel apart.
+        L.dest.left = L.imgArea.left + (LONG)((areaW - viewW) / 2 + 0.5);
+        L.dest.right = L.dest.left + (LONG)(viewW + 0.5);
         g.panX = 0;
     } else {
         const double maxPan = g.dispW - areaW / L.scale;
@@ -541,8 +564,8 @@ Layout ComputeLayout(const RECT& client) {
     if (viewH <= areaH) {
         L.srcY = 0;
         L.srcH = g.dispH;
-        L.dest.top = L.imgArea.top + (LONG)((areaH - viewH) / 2);
-        L.dest.bottom = L.dest.top + (LONG)viewH;
+        L.dest.top = L.imgArea.top + (LONG)((areaH - viewH) / 2 + 0.5);
+        L.dest.bottom = L.dest.top + (LONG)(viewH + 0.5);
         g.panY = 0;
     } else {
         const double maxPan = g.dispH - areaH / L.scale;
@@ -576,6 +599,13 @@ GridLayout ComputeGrid(const RECT& client) {
     gl.cols = (std::max)(1, g.gridCols);
     gl.cell = (std::max)(1L, client.right - client.left) / gl.cols;
     if (gl.cell < 1) gl.cell = 1;
+    // Integer division leaves up to cols-1 spare pixels; split them so the
+    // grid is centered instead of hugging the left edge with a dead gutter.
+    const int slack = (client.right - client.left) - gl.cols * gl.cell;
+    if (slack > 0) {
+        gl.area.left += slack / 2;
+        gl.area.right = gl.area.left + gl.cols * gl.cell;
+    }
     const int n = (int)g.files.size();
     gl.rows = (n + gl.cols - 1) / gl.cols;
     gl.contentH = gl.rows * gl.cell;
@@ -701,7 +731,9 @@ void PaintGrid(HDC dc, const RECT& client) {
     if (g.files.empty()) {
         DrawCenteredText(dc, client,
                          g.listPending ? L"Loading…"
-                                       : L"Drop images or a folder here — or press Ctrl+O");
+                         : g.listWasEmpty
+                             ? L"No supported images or videos in this folder."
+                             : L"Drop images or a folder here — or press Ctrl+O");
         return;
     }
     const int viewH = client.bottom - client.top;
@@ -802,6 +834,9 @@ UiRects ComputeUiRects(const RECT& imgArea) {
         const int mid = (r.videoBar.top + r.videoBar.bottom) / 2;
         r.seekBar = {r.playBtn.right + m + Scaled(96), mid - Scaled(3),
                      r.videoBar.right - m, mid + Scaled(3)};
+        // A very narrow window can push left past right; collapse to empty
+        // rather than an inverted rect that breaks the fill math and hit test.
+        if (r.seekBar.left > r.seekBar.right) r.seekBar.left = r.seekBar.right;
     }
     return r;
 }
@@ -842,6 +877,22 @@ void DrawCenteredText(HDC dc, const RECT& rc, const wchar_t* text) {
     SetBkMode(dc, TRANSPARENT);
     RECT t = rc;
     DrawTextW(dc, text, -1, &t, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dc, oldFont);
+}
+
+// Multi-line variant for messages that carry a path or a diagnostic on
+// separate lines (DT_SINGLELINE would render the newlines as glyphs).
+void DrawCenteredTextML(HDC dc, const RECT& rc, const wchar_t* text) {
+    EnsureFonts();
+    HGDIOBJ oldFont = SelectObject(dc, g.fontBig);
+    SetTextColor(dc, kTextDim);
+    SetBkMode(dc, TRANSPARENT);
+    RECT m = rc;
+    DrawTextW(dc, text, -1, &m, DT_CENTER | DT_WORDBREAK | DT_CALCRECT);
+    RECT t = rc;
+    t.top = (std::max)(rc.top, rc.top + ((rc.bottom - rc.top) - (m.bottom - m.top)) / 2);
+    t.bottom = rc.bottom;
+    DrawTextW(dc, text, -1, &t, DT_CENTER | DT_WORDBREAK);
     SelectObject(dc, oldFont);
 }
 
@@ -904,6 +955,16 @@ std::vector<std::pair<std::wstring, std::wstring>> BuildDetails() {
         }
     }
     return rows;
+}
+
+// Cached details rows. BuildDetails stats the file and formats dates — much
+// too heavy to run on every WM_PAINT (the video timer repaints continuously).
+const std::vector<std::pair<std::wstring, std::wstring>>& Details() {
+    if (g.detailsDirty) {
+        g.detailRows = BuildDetails();
+        g.detailsDirty = false;
+    }
+    return g.detailRows;
 }
 
 // Details panel rectangle in client coordinates — shared by Paint (which
@@ -973,11 +1034,22 @@ void Paint(HDC dcWin, const RECT& client) {
             DrawCenteredText(dc, L.imgArea, L"Loading…");
         }
     } else if (g.cur >= 0 && g.decodeFailed) {
-        DrawCenteredText(dc, L.imgArea, L"Can't display this file.");
+        // Prefer the specific diagnosis (engine error / empty file / corrupt)
+        // over the generic line, so distinct failures look distinct.
+        DrawCenteredTextML(dc, L.imgArea,
+                           !g.videoError.empty()  ? g.videoError.c_str()
+                           : !g.failReason.empty() ? g.failReason.c_str()
+                                                   : L"Can't display this file.");
+    } else if (g.videoMode && !g.videoOpened) {
+        // player_open is async; without this the user stares at a bare black
+        // child window until PLAYER_EVT_OPENED arrives.
+        DrawCenteredText(dc, L.imgArea, L"Loading…");
     } else if (g.cur < 0) {
         DrawCenteredText(dc, L.imgArea,
                          g.listPending ? L"Loading…"
-                                       : L"Drop images or a folder here — or press Ctrl+O");
+                         : g.listWasEmpty
+                             ? L"No supported images or videos in this folder."
+                             : L"Drop images or a folder here — or press Ctrl+O");
     }
 
     UiRects ui = ComputeUiRects(L.imgArea);
@@ -1019,10 +1091,26 @@ void Paint(HDC dcWin, const RECT& client) {
         DrawButton(dc, ui.playBtn, showPlay ? L"Play" : L"Pause", g.fontUi);
 
         const double dur = g.player ? player_duration(g.player) : 0.0;
-        const double pos = g.videoEnded ? dur : (g.player ? player_position(g.player) : 0.0);
-        wchar_t buf[64];
-        swprintf(buf, 64, L"%d:%02d / %d:%02d", (int)pos / 60, (int)pos % 60,
-                 (int)dur / 60, (int)dur % 60);
+        double pos = g.videoEnded ? dur : (g.player ? player_position(g.player) : 0.0);
+        // A just-requested seek paints at its target briefly, so the fill
+        // doesn't rubber-band back to the pre-seek position while the async
+        // seek completes.
+        if (g.seekFlashPos >= 0) {
+            if (GetTickCount() - g.seekFlashTick < 400) pos = g.seekFlashPos;
+            else g.seekFlashPos = -1;
+        }
+        // H:MM:SS once an hour is involved (both sides share the format so
+        // the readout doesn't flip widths); plain M:SS below that.
+        const bool hours = dur >= 3600 || pos >= 3600;
+        auto fmtTime = [hours](wchar_t* out, size_t n, double s) {
+            int v = (int)s;
+            if (hours) swprintf(out, n, L"%d:%02d:%02d", v / 3600, (v / 60) % 60, v % 60);
+            else swprintf(out, n, L"%d:%02d", v / 60, v % 60);
+        };
+        wchar_t ps[24], ds[24], buf[64];
+        fmtTime(ps, 24, pos);
+        fmtTime(ds, 24, dur);
+        swprintf(buf, 64, L"%ls / %ls", ps, ds);
         RECT trc = {ui.playBtn.right + Scaled(8), ui.videoBar.top,
                     ui.seekBar.left - Scaled(4), ui.videoBar.bottom};
         HGDIOBJ oldFont = SelectObject(dc, g.fontUi);
@@ -1045,7 +1133,7 @@ void Paint(HDC dcWin, const RECT& client) {
     }
 
     if (g.showDetails && g.cur >= 0) {
-        auto rows = BuildDetails();
+        const auto& rows = Details();
         const int pad = Scaled(12), lineH = Scaled(20), labelW = Scaled(100);
         RECT panel = DetailsPanelRect(L.imgArea, rows.size());
         HBRUSH pb = CreateSolidBrush(kPanelBg);
@@ -1116,7 +1204,9 @@ void StopSlideshow() {
 // navigation, probe arrival).
 void PositionVideoWindow() {
     if (!g.videoWnd) return;
-    if (!g.videoMode || g.gridMode) {
+    // Keep the child hidden until OPENED so the "Loading…" hint in the parent
+    // shows through instead of a bare black rectangle.
+    if (!g.videoMode || g.gridMode || !g.videoOpened) {
         SetWindowRgn(g.videoWnd, nullptr, TRUE);
         ShowWindow(g.videoWnd, SW_HIDE);
         return;
@@ -1128,7 +1218,7 @@ void PositionVideoWindow() {
     SetWindowPos(g.videoWnd, nullptr, v.left, v.top, v.right - v.left,
                  v.bottom - v.top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     if (g.showDetails && g.cur >= 0) {
-        RECT panel = DetailsPanelRect(L.imgArea, BuildDetails().size());
+        RECT panel = DetailsPanelRect(L.imgArea, Details().size());
         OffsetRect(&panel, -v.left, -v.top); // child-relative coordinates
         HRGN rgn = CreateRectRgn(0, 0, v.right - v.left, v.bottom - v.top);
         HRGN hole = CreateRectRgn(panel.left, panel.top, panel.right, panel.bottom);
@@ -1141,9 +1231,19 @@ void PositionVideoWindow() {
     if (g.player) player_notify_resize(g.player);
 }
 
+// Remember a just-requested seek target so the transport bar paints there
+// immediately instead of rubber-banding until the async seek lands.
+void SeekFlash(double target) {
+    const double dur = g.player ? player_duration(g.player) : 0.0;
+    if (dur > 0) target = (std::max)(0.0, (std::min)(target, dur));
+    g.seekFlashPos = target;
+    g.seekFlashTick = GetTickCount();
+}
+
 void VideoPlayPause() {
     if (!g.player || !g.videoMode) return;
     if (g.videoEnded) {
+        SeekFlash(0);
         player_seek_to(g.player, 0); // restart from the top after the end
         if (player_is_paused(g.player)) player_toggle_pause(g.player);
         g.videoEnded = false;
@@ -1155,6 +1255,7 @@ void VideoPlayPause() {
 
 void VideoSeekBy(double seconds) {
     if (!g.player || !g.videoMode) return;
+    SeekFlash(player_position(g.player) + seconds);
     player_seek_rel(g.player, seconds);
     g.videoEnded = false;
     InvalidateRect(g.hwnd, nullptr, FALSE);
@@ -1223,7 +1324,12 @@ void LoadCurrent() {
     g.decodeFailed = false;
     g.decodePending = false;
     g.videoEnded = false;
+    g.videoOpened = false;
     g.videoProbed = false;
+    g.videoError.clear();
+    g.failReason.clear();
+    g.seekFlashPos = -1;
+    g.detailsDirty = true;
 
     const bool video = g.cur >= 0 && IsPlayableVideo(g.files[g.cur]);
     if (g.videoMode && !video) {
@@ -1245,7 +1351,7 @@ void LoadCurrent() {
                 reinterpret_cast<void*>(static_cast<UINT_PTR>(++g.playerGen)));
             player_open(g.player, path.c_str());
             g.worker.RequestProbe(path);
-            SetTimer(g.hwnd, kTimerVideo, 250, nullptr);
+            SetTimer(g.hwnd, kTimerVideo, 100, nullptr); // smooth seek-fill motion
         } else if (auto img = CacheGet(CacheKey(path, g.page))) {
             g.disp = img;
             RebuildDisplayBitmap();
@@ -1336,6 +1442,7 @@ bool CanonicalPath(const wchar_t* in, std::wstring& out) {
 void StartListThread(const std::wstring& target, bool isFolder) {
     g.listGen++;
     g.listPending = true;
+    g.listWasEmpty = false; // a fresh scan owns the empty-state message
     auto* req = new ListReq{g.hwnd, g.listGen, target, isFolder};
     HANDLE h = CreateThread(nullptr, 0, ListThreadProc, req, 0, nullptr);
     if (h)
@@ -1614,7 +1721,17 @@ void OnDecoded(DecodeDone* d) {
             PrefetchNeighbors();
         } else {
             g.decodeFailed = true;
+            // Distinguish the two commonest, cheaply-diagnosable causes so the
+            // user isn't left with only the generic line.
+            WIN32_FILE_ATTRIBUTE_DATA fad{};
+            if (GetFileAttributesExW(d->path.c_str(), GetFileExInfoStandard, &fad) &&
+                fad.nFileSizeLow == 0 && fad.nFileSizeHigh == 0)
+                g.failReason = L"This file is empty (0 bytes).";
+            else
+                g.failReason =
+                    L"This file couldn't be decoded — it may be corrupt or truncated.";
         }
+        g.detailsDirty = true; // dimensions/page rows may have changed
         InvalidateRect(g.hwnd, nullptr, FALSE);
         UpdateTitle();
     }
@@ -1642,6 +1759,7 @@ void OnProbed(ProbeDone* d) {
     if (!d->ok || !g.videoMode || g.cur < 0 || g.files[g.cur] != d->path) return;
     g.videoInfo = d->info;
     g.videoProbed = true;
+    g.detailsDirty = true; // codec/track rows just arrived
     if (g.showDetails) {
         PositionVideoWindow(); // the panel gained rows; regrow the region hole
         InvalidateRect(g.hwnd, nullptr, FALSE);
@@ -1654,7 +1772,10 @@ void OnPlayerMessage(WPARAM evt, LPARAM gen) {
     if (!g.videoMode || static_cast<unsigned>(gen) != g.playerGen) return;
     switch (static_cast<PlayerEvent>(evt)) {
         case PLAYER_EVT_OPENED:
-            break; // duration/position are valid now; repaint below
+            g.videoOpened = true;   // the child window may show itself now
+            g.detailsDirty = true;  // duration/position are valid now
+            PositionVideoWindow();
+            break;
         case PLAYER_EVT_ENDED:
             g.videoEnded = true;
             // A finished video stays put on its last frame; we never auto-advance
@@ -1664,14 +1785,20 @@ void OnPlayerMessage(WPARAM evt, LPARAM gen) {
                 return;
             }
             break;
-        case PLAYER_EVT_ERROR:
-            // Fall back to the standard "Can't display this file." surface.
+        case PLAYER_EVT_ERROR: {
+            // Surface the engine's own diagnostic ("Cannot open file… <why>",
+            // "No decodable streams", …) instead of only the generic line.
+            // Grab it before close, which resets pipeline state.
+            wchar_t err[512] = L"";
+            if (g.player) player_last_error(g.player, err, 512);
+            g.videoError = err;
             g.videoMode = false;
             g.decodeFailed = true;
             if (g.player) player_close(g.player);
             KillTimer(g.hwnd, kTimerVideo);
             PositionVideoWindow();
             break;
+        }
     }
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
@@ -1695,6 +1822,9 @@ void OnListDone(ListDone* d) {
     std::wstring shownPath = (g.cur >= 0) ? g.files[g.cur] : L"";
     g.files = std::move(d->files);
     g.strip.SetItems(&g.files);
+    // Distinguish "scan found nothing" from "nothing opened yet": the empty
+    // state then explains itself instead of showing the fresh-launch hint.
+    g.listWasEmpty = g.files.empty();
     if (g.files.empty()) {
         g.cur = -1;
         LoadCurrent();
@@ -1861,7 +1991,9 @@ void OnLButtonDown(POINT pt) {
             const double dur = g.player ? player_duration(g.player) : 0.0;
             if (dur > 0) {
                 const double w = (std::max)(1L, ui.seekBar.right - ui.seekBar.left);
-                player_seek_to(g.player, dur * (pt.x - ui.seekBar.left) / w);
+                const double target = dur * (pt.x - ui.seekBar.left) / w;
+                SeekFlash(target);
+                player_seek_to(g.player, target);
                 g.videoEnded = false;
                 InvalidateRect(g.hwnd, nullptr, FALSE);
             }
@@ -1950,8 +2082,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         case WM_GETMINMAXINFO: {
+            // DPI-scaled: at 200% the chrome (filmstrip + transport + buttons)
+            // needs twice the room, or the image area collapses to a sliver.
             MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
-            mmi->ptMinTrackSize = {480, 360};
+            mmi->ptMinTrackSize = {Scaled(480), Scaled(360)};
             return 0;
         }
         case WM_COMMAND:
@@ -1989,7 +2123,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g.interactive = false;
                 InvalidateRect(hwnd, nullptr, FALSE);
             } else if (wParam == kTimerVideo && g.videoMode) {
-                InvalidateRect(hwnd, nullptr, FALSE); // transport bar progress
+                // Repaint only the transport bar; a full-window invalidate on
+                // every tick would redraw thumbnails, details and letterbox
+                // for a change confined to the seek fill and time text.
+                Layout L = ComputeLayout(ClientRect());
+                RECT bar = {L.imgArea.left, L.imgArea.bottom - Scaled(kVideoBarH),
+                            L.imgArea.right, L.imgArea.bottom};
+                InvalidateRect(hwnd, &bar, FALSE);
             } else if (wParam == kTimerSlideshow) {
                 if (g.slideshow && !g.gridMode && !g.videoMode) SlideshowAdvance();
             }
@@ -2002,6 +2142,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case WM_DPICHANGED: {
             g.dpi = HIWORD(wParam);
+            g.strip.SetDpi(g.dpi);
             const RECT* r = reinterpret_cast<const RECT*>(lParam);
             SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left,
                          r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -2128,6 +2269,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
 
     g.worker.Start(g.hwnd);
     g.strip.Start(g.hwnd, WM_APP_THUMB);
+    g.strip.SetDpi(g.dpi);
     g.strip.SetItems(&g.files);
 
     int argc = 0;

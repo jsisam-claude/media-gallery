@@ -214,7 +214,9 @@ void player_seek_to(Player* p, double seconds) {
     if (!p->running) return;
     double target = seconds;
     if (target < 0) target = 0;
-    if (p->duration > 0 && target > p->duration - 0.5) target = p->duration - 0.5;
+    // Keep a small margin so a seek-to-end still lands on a decodable frame,
+    // but don't fence off the last half-second — ENDED handles a true EOF.
+    if (p->duration > 0 && target > p->duration - 0.1) target = p->duration - 0.1;
     std::lock_guard<std::mutex> lk(p->seek_m);
     p->seek_to = target;
     p->seek_req = true;

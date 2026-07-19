@@ -161,12 +161,17 @@ void video_render_thread(Player* p) {
         return;
     }
     bool first_frame = true;
+    bool osd_on_frame = false;  // last presented frame carries OSD text
     int fps_count = 0;
     double fps = 0;
     int64_t fps_t0 = av_gettime_relative();
 
     while (!p->abort) {
         if (p->paused) {
+            // A banner shown while paused would otherwise stay burned on the
+            // frozen frame forever (nothing repaints it); re-present once the
+            // OSD expires so it clears on time.
+            if (osd_on_frame && p->osd_now().empty()) p->redraw_req = true;
             if (p->step_req.exchange(false)) {
                 FQFrame fr;
                 bool got = p->vfq.pop(fr, 200);
@@ -187,10 +192,13 @@ void video_render_thread(Player* p) {
                         double pts = fr.pts;
                         SubRender ov;
                         ov.osd = p->osd_now();
+                        osd_on_frame = !ov.osd.empty();
                         if (!std::isnan(pts)) {
                             ov.text = p->subs.active_at(pts - p->sub_delay);
                             p->subs.active_bitmaps_at(pts - p->sub_delay, ov.bitmaps);
-                            add_ass_overlay(p, pts, fr.f->width, fr.f->height, ov);
+                            bool sw = p->rotation == 90 || p->rotation == 270;
+                            add_ass_overlay(p, pts, sw ? fr.f->height : fr.f->width,
+                                            sw ? fr.f->width : fr.f->height, ov);
                         }
                         p->vo->render(fr.f, ov, p->rotation);
                         if (!std::isnan(pts)) {
@@ -211,11 +219,15 @@ void video_render_thread(Player* p) {
                     double lp = p->vclock.load();
                     SubRender ov;
                     ov.osd = p->osd_now();
+                    osd_on_frame = !ov.osd.empty();
                     if (!std::isnan(lp)) {
                         ov.text = p->subs.active_at(lp - p->sub_delay);
                         p->subs.active_bitmaps_at(lp - p->sub_delay, ov.bitmaps);
-                        add_ass_overlay(p, lp, p->last_frame->width,
-                                        p->last_frame->height, ov);
+                        bool sw = p->rotation == 90 || p->rotation == 270;
+                        add_ass_overlay(p, lp,
+                                        sw ? p->last_frame->height : p->last_frame->width,
+                                        sw ? p->last_frame->width : p->last_frame->height,
+                                        ov);
                     }
                     p->vo->render(p->last_frame, ov, p->rotation);
                 }
@@ -288,6 +300,7 @@ void video_render_thread(Player* p) {
 
         SubRender ov;
         ov.osd = p->osd_now();
+        osd_on_frame = !ov.osd.empty();  // transient OSD only, not the HUD
         if (p->hud && ov.osd.empty()) {
             wchar_t h[192];
             swprintf(h, 192,
@@ -303,7 +316,13 @@ void video_render_thread(Player* p) {
         if (!std::isnan(pts)) {
             ov.text = p->subs.active_at(pts - p->sub_delay);
             p->subs.active_bitmaps_at(pts - p->sub_delay, ov.bitmaps);
-            add_ass_overlay(p, pts, fr.f->width, fr.f->height, ov);
+            // Render libass at DISPLAY orientation: the overlay is scaled
+            // into the (rotation-swapped) video rect as-is, so a 90/270
+            // clip needs a portrait canvas or the text comes out sideways
+            // and stretched.
+            bool swap_wh = p->rotation == 90 || p->rotation == 270;
+            add_ass_overlay(p, pts, swap_wh ? fr.f->height : fr.f->width,
+                            swap_wh ? fr.f->width : fr.f->height, ov);
         }
         p->vo->render(fr.f, ov, p->rotation);
         if (!std::isnan(pts)) p->vclock.store(pts);
