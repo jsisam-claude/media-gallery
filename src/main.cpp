@@ -587,6 +587,7 @@ RECT ClientRect(); // fwd decls (defined below)
 void DrawCenteredText(HDC dc, const RECT& rc, const wchar_t* text);
 void PositionVideoWindow();
 void StopSlideshow();
+void UpdateTitle();
 
 struct GridLayout {
     int cols = 1, cell = 1, rows = 0, contentH = 0;
