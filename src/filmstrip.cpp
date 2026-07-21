@@ -199,6 +199,7 @@ void Filmstrip::TouchLru(const std::wstring& key, Entry& e) const {
     lru_.erase(e.lruIt);
     lru_.push_back(key);
     e.lruIt = std::prev(lru_.end());
+    e.touch = paintGen_;  // pin against eviction for this paint pass
 }
 
 void Filmstrip::EvictEntry(const std::wstring& key) {
@@ -255,11 +256,23 @@ HBITMAP Filmstrip::GetThumbAny(const std::wstring& path) const {
 }
 
 void Filmstrip::EvictIfNeeded() {
-    // Least-recently-used first; anything on screen was just touched by Draw,
-    // so visible thumbnails are never the ones evicted.
-    while ((cacheBytes_ > kCacheBudgetBytes || cache_.size() > kCacheMaxEntries) &&
-           !lru_.empty()) {
-        const std::wstring key = lru_.front();
+    if (cacheBytes_ <= kCacheBudgetBytes && cache_.size() <= kCacheMaxEntries) return;
+    // Least-recently-used first, but NEVER evict the current paint's working set
+    // (entries touched by the last Draw/PaintGrid). Evicting a visible entry
+    // makes the next paint re-request it, and if the visible bytes alone exceed
+    // the budget that becomes a decode/evict/re-request livelock. Collecting
+    // victims before erasing also avoids invalidating the lru_ iterator we scan.
+    std::vector<std::wstring> victims;
+    size_t bytesAfter = cacheBytes_, countAfter = cache_.size();
+    for (const auto& key : lru_) {
+        if (bytesAfter <= kCacheBudgetBytes && countAfter <= kCacheMaxEntries) break;
+        auto it = cache_.find(key);
+        if (it == cache_.end() || it->second.touch == paintGen_) continue; // pinned
+        victims.push_back(key);
+        bytesAfter -= it->second.bytes;
+        --countAfter;
+    }
+    for (const auto& key : victims) {
         requested_.erase(key); // allow a future re-request
         EvictEntry(key);
     }
@@ -299,6 +312,7 @@ int Filmstrip::HitTest(POINT pt, const RECT& rc) const {
 }
 
 void Filmstrip::Draw(HDC dc, const RECT& rc) {
+    BeginPaint();  // pin the cells this pass touches against LRU eviction
     HBRUSH bg = CreateSolidBrush(RGB(32, 32, 32));
     FillRect(dc, &rc, bg);
     DeleteObject(bg);

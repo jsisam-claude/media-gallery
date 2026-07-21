@@ -21,6 +21,7 @@ public:
     void SetItems(const std::vector<std::wstring>* items); // owned by the app
     void SetCurrent(int index);                            // scrolls it into view
     void SetDpi(int dpi) { dpi_ = dpi; }                   // scales pads/gaps
+    void BeginPaint() { ++paintGen_; }                     // marks a new paint pass
     void InvalidateThumb(const std::wstring& path);        // file changed on disk
 
     struct ThumbResult {
@@ -52,6 +53,8 @@ private:
     struct Entry {
         HBITMAP bmp = nullptr; // null = load failed (remembered, not re-requested)
         size_t bytes = 0;
+        unsigned touch = 0;    // paint pass that last used it; the current pass
+                               // (the visible working set) is never evicted
         std::list<std::wstring>::iterator lruIt;
     };
     void TouchLru(const std::wstring& key, Entry& e) const;
@@ -75,7 +78,8 @@ private:
     mutable std::list<std::wstring> lru_; // front = oldest
     size_t cacheBytes_ = 0;
     std::unordered_map<std::wstring, bool> requested_;
-    unsigned gen_ = 0; // bumped by InvalidateThumb; stale worker results dropped
+    unsigned gen_ = 0;      // bumped by InvalidateThumb; stale worker results dropped
+    unsigned paintGen_ = 0; // bumped each paint; entries touched this pass are pinned
 
     struct Job {
         std::wstring path;

@@ -640,6 +640,9 @@ void GridEnsureVisible() {
 void ToggleGrid() {
     g.gridMode = !g.gridMode;
     if (g.gridMode) {
+        // Cancel an in-progress viewer pan drag; otherwise mouse-moves in the
+        // grid keep mutating the hidden viewer's pan state.
+        if (g.dragging) { g.dragging = false; ReleaseCapture(); }
         StopSlideshow(); // the grid pauses video below; a slideshow ends instead
         g.gridSel = (std::max)(0, g.cur);
         GridEnsureVisible();
@@ -693,6 +696,15 @@ void NavigateTo(int index, bool resetPage = true, bool relative = false);
 
 void OpenFromGrid(int index) {
     if (index < 0 || index >= (int)g.files.size()) return;
+    if (index == g.cur) {
+        // Already the current item — just leave the grid. Reopening it would
+        // restart a playing video from 0:00 and re-decode the image for nothing.
+        g.gridMode = false;
+        PositionVideoWindow();
+        UpdateTitle();
+        InvalidateRect(g.hwnd, nullptr, FALSE);
+        return;
+    }
     g.gridMode = false;
     NavigateTo(index, true);
 }
@@ -744,6 +756,7 @@ void DrawTypeBadge(HDC dc, const std::wstring& path, int tx, int ty, int tw, int
 }
 
 void PaintGrid(HDC dc, const RECT& client) {
+    g.strip.BeginPaint();  // pin this pass's visible thumbs against LRU eviction
     GridLayout gl = ComputeGrid(client);
     if (g.files.empty()) {
         DrawCenteredText(dc, client,
@@ -1484,10 +1497,14 @@ void StartListThread(const std::wstring& target, bool isFolder) {
     g.listWasEmpty = false; // a fresh scan owns the empty-state message
     auto* req = new ListReq{g.hwnd, g.listGen, target, isFolder};
     HANDLE h = CreateThread(nullptr, 0, ListThreadProc, req, 0, nullptr);
-    if (h)
+    if (h) {
         CloseHandle(h);
-    else
+    } else {
+        // No scan will run (and no WM_APP_LIST will clear listPending), so the
+        // window would show "Loading…" forever. Clear it now.
         delete req;
+        g.listPending = false;
+    }
 }
 
 // Open a file or folder (command line, Ctrl+O, or drag & drop).
@@ -1582,11 +1599,19 @@ void HandleDrop(HDROP drop) {
     MaybeCommitRotation();
     g.listGen++; // invalidate any in-flight folder scan
     g.listPending = false;
+    // A dropped selection isn't a folder scan; if it later empties out, the hint
+    // should read as the generic drop prompt, not "nothing in this folder".
+    g.listWasEmpty = false;
     AdoptFileList(std::move(images), 0);
 }
 
 void RotateView(int delta) {
     if (!g.disp) return;
+    // Don't add rotation while a save of this file is in flight: OnSaved reloads
+    // the file (which will bake in only the quarter it captured) and resets
+    // g.rot to 0, so any turn added meanwhile would be silently lost and the
+    // view would snap back. Rotation re-enables the moment the save completes.
+    if (g.savePending) return;
     g.rot = ((g.rot + delta) % 4 + 4) % 4;
     g.fitMode = true;
     RebuildDisplayBitmap();
@@ -1685,6 +1710,8 @@ void DeleteAt(int index) {
         g.page = 0;
         g.fitMode = true;
         LoadCurrent();
+    } else {
+        UpdateTitle(); // the "(cur/N)" count shrank even though cur is unchanged
     }
     g.gridSel = (std::max)(0, (std::min)(index, (int)g.files.size() - 1));
     if (g.gridMode) GridEnsureVisible();
@@ -2022,8 +2049,10 @@ void OnInitMenuPopup(HMENU menu) {
     // silently no-op if the menu let it through.
     enable(IDM_EDIT_PAINT, g.gridMode ? gridSelImage : (haveDisp && !g.videoMode));
     enable(IDM_DELETE, g.gridMode ? haveAny : haveImage);
-    enable(IDM_ROTATE_CW, haveDisp && !g.gridMode);
-    enable(IDM_ROTATE_CCW, haveDisp && !g.gridMode);
+    // Rotate is guarded against firing during an in-flight save (RotateView
+    // early-returns); gray it to match, so the menu doesn't offer a silent no-op.
+    enable(IDM_ROTATE_CW, haveDisp && !g.gridMode && !g.savePending);
+    enable(IDM_ROTATE_CCW, haveDisp && !g.gridMode && !g.savePending);
     enable(IDM_SAVE, haveDisp && !g.gridMode && g.rot != 0 && !g.savePending);
     enable(IDM_ZOOMIN, g.gridMode || haveDisp);
     enable(IDM_ZOOMOUT, g.gridMode || haveDisp);

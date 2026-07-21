@@ -70,19 +70,35 @@ public:
                  std::vector<float>& out) {
         if (speed > 0.99 && speed < 1.01) {  // unity: bypass
             if (primed_) {
-                // Flush the audio buffered but not yet emitted, or returning to
-                // 1.0x skips ~40-60ms (an audible click). tail_ IS the pending
-                // not-yet-output window (input [best+half_, best+win_)); for
-                // speed>1 the per-hop erase has already dropped that span from
-                // in_, so tail_ is the only surviving copy. Emit tail_, then the
-                // input past the window (cont_+half_ in current in_ coords) —
-                // correct and gap-free for both slow and fast.
-                out.insert(out.end(), tail_.begin(), tail_.end());
+                // Flush what's buffered but not yet emitted, or the return to
+                // 1.0x clicks. tail_ is the pending window (input [best+half_,
+                // best+win_)); the continuation is the input just past it, at
+                // cont_+half_ in current in_ coordinates.
                 int have = (int)(in_.size() / ch_);
                 int wend = cont_ + half_;
-                if (wend < 0) wend = 0;
-                if (wend < have)
-                    out.insert(out.end(), in_.begin() + (size_t)wend * ch_, in_.end());
+                if (wend >= 0) {
+                    // Slow / moderate speed: the continuation input is still in
+                    // in_, so the handover is exactly sample-continuous.
+                    out.insert(out.end(), tail_.begin(), tail_.end());
+                    if (wend < have)
+                        out.insert(out.end(), in_.begin() + (size_t)wend * ch_, in_.end());
+                } else {
+                    // Fast speed (>~2.5x): the per-hop erase discarded the input
+                    // between the window end and the current front to achieve
+                    // the speed-up — that audio was never going to play, so the
+                    // source position legitimately jumps forward here. Crossfade
+                    // the window tail into the raw front over half_ samples so
+                    // the jump is inaudible (no click) instead of a hard splice.
+                    int nx = half_ < have ? half_ : have;
+                    for (int i = 0; i < nx; i++) {
+                        float wf = (float)i / half_;
+                        for (int c = 0; c < ch_; c++)
+                            out.push_back(tail_[(size_t)i * ch_ + c] * (1.0f - wf) +
+                                          in_[(size_t)i * ch_ + c] * wf);
+                    }
+                    if (have > nx)
+                        out.insert(out.end(), in_.begin() + (size_t)nx * ch_, in_.end());
+                }
                 reset();
             }
             out.insert(out.end(), in, in + (size_t)nsamples * ch_);
